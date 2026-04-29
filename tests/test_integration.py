@@ -37,6 +37,12 @@ class _HttpTestBase(_PatchedManagerMixin, unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         self.port = s.getsockname()[1]
         s.close()
+        # Safety check: ensure we're not using the default daemon port
+        from sessions.server import DEFAULT_API_PORT
+        if self.port == DEFAULT_API_PORT:
+            raise RuntimeError(
+                f"Test server bound to default daemon port {DEFAULT_API_PORT}. "
+                "Stop the daemon before running tests to avoid accidental shutdown.")
         self.server = make_server(self.mgr, port=self.port)
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)

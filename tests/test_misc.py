@@ -514,6 +514,19 @@ class TestCLIStopStatus(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    @staticmethod
+    def _daemon_is_running():
+        """Check if a real daemon is running by looking for the PID file."""
+        from sessions.cli import DAEMON_PID_FILE
+        import json as _json
+        try:
+            with open(DAEMON_PID_FILE) as f:
+                info = _json.load(f)
+                return bool(info.get("pid"))
+        except (OSError, ValueError):
+            return False
+
+    @unittest.skipIf(_daemon_is_running.__func__(), "Skip if daemon is running")
     def test_cmd_stop_no_daemon(self):
         """cmd_stop prints 'daemon not running' and returns 0 when no PID file."""
         import io
@@ -525,6 +538,7 @@ class TestCLIStopStatus(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertIn("daemon not running", mock_out.getvalue())
 
+    @unittest.skipIf(_daemon_is_running.__func__(), "Skip if daemon is running")
     def test_cmd_stop_stale_pid(self):
         """cmd_stop with a PID file pointing to a gone process cleans up gracefully."""
         import json as _json

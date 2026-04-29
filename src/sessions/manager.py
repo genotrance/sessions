@@ -1506,6 +1506,12 @@ class ContainerManager:
         try:
             with self._browser_session() as bs:
                 bs.target.activate_target(tid)
+            # Focus the search box in the dashboard
+            try:
+                with CDPSession(self._browser_port, tid, flatten=True) as sess:
+                    sess.runtime.evaluate("document.getElementById('search-box').focus()", timeout=2)
+            except Exception:
+                pass
             self._foreground_chrome(maximized=True)
             return True
         except Exception:
