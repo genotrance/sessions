@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sessions"
+version = "0.1.0"
+description = "Browser isolation and session manager for Chromium"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "websocket-client>=1.6.0",
+    "keyboard>=0.13.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/genotrance/sessions"
+Issues = "https://github.com/genotrance/sessions/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.4.0",
+    "build>=1.0.0",
+    "twine>=5.0.0",
+]
+
+[project.scripts]
+sessions = "sessions.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "S",   # flake8-bandit (security)
+]
+ignore = [
+    "E501",   # line length (handled by formatter)
+    "S101",   # assert usage (fine in tests)
+    "S110",   # try-except-pass: intentional cleanup/suppression throughout
+    "S108",   # /tmp usage: intentional (XDG_RUNTIME_DIR fallback on Linux)
+    "S310",   # urlopen: always http://127.0.0.1 — no external URLs
+    "S603",   # subprocess calls (required for Chrome launch)
+    "S607",   # partial path in Popen (Chrome paths are user-configured)
+    "B904",   # raise from in except (noisy, not always appropriate)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S106", "E402", "I001"]  # sys.path.insert before imports breaks isort
+"scripts/**/*.py" = ["S101", "E402", "I001"]
+"tests/test_context_daemon.py" = ["F401"]  # re-exported for unittest discover
+"tests/test_focus_live.py" = ["B023"]  # win32 callback closure pattern
+"src/sessions/__init__.py" = ["I001"]  # ruff isort false-positive on re-export module
+"src/sessions/cli.py" = ["I001"]  # try: import keyboard after imports confuses isort
+"src/sessions/manager.py" = ["I001"]  # large mixed import block; order is intentional
