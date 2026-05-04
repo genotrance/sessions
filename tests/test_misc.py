@@ -538,25 +538,34 @@ class TestCLIStopStatus(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertIn("daemon not running", mock_out.getvalue())
 
-    @unittest.skipIf(_daemon_is_running.__func__(), "Skip if daemon is running")
     def test_cmd_stop_stale_pid(self):
-        """cmd_stop with a PID file pointing to a gone process cleans up gracefully."""
+        """cmd_stop with a PID file pointing to a gone process cleans up gracefully.
+        urllib.request.urlopen is mocked to prevent any real HTTP call to the daemon."""
         import json as _json
         from sessions.cli import cmd_stop
-        from unittest.mock import patch
+        from unittest.mock import patch, MagicMock
         import io
         pid_file = os.path.join(self.tmp, "sessions-api.pid")
         with open(pid_file, "w") as f:
-            _json.dump({"pid": 99999999, "api_port": 9999}, f)
+            # Use a port that is clearly not the default daemon port (9999)
+            # and a PID that cannot exist.  urlopen is also mocked to guarantee
+            # no real HTTP request is ever sent.
+            _json.dump({"pid": 99999999, "api_port": 59999}, f)
         with patch("sessions.cli.DAEMON_PID_FILE", pid_file):
             with patch("sessions.cli._remove_daemon_pid"):
-                with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
-                    ret = cmd_stop(None)
+                with patch("urllib.request.urlopen",
+                           side_effect=OSError("mocked – no real HTTP")) as mock_urlopen:
+                    with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                        ret = cmd_stop(None)
         self.assertEqual(ret, 0)
         self.assertTrue(
             "stopped" in mock_out.getvalue() or "stale" in mock_out.getvalue()
             or "could not" in mock_out.getvalue()
         )
+        # urlopen must have been called with the mocked port, never the real one
+        for call in mock_urlopen.call_args_list:
+            url = str(call)
+            self.assertNotIn(":9999", url, "cmd_stop must not contact the real daemon port")
 
     def test_cmd_status_no_daemon(self):
         """cmd_status returns JSON with browser status even when daemon not running."""

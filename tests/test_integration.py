@@ -953,23 +953,20 @@ class TestRestartMechanics(_HttpTestBase):
         belongs to the current process. This was the root cause of restart
         self-shutdown: the new process wrote its PID, then _reclaim_stale_chrome
         read it back and shut itself down."""
-        from sessions.cli import _reclaim_stale_chrome, _write_daemon_pid, DAEMON_PID_FILE
+        from sessions.cli import _reclaim_stale_chrome, _write_daemon_pid
         import os
+        import tempfile
 
-        # Write a PID file with our own PID and the test server port
-        _write_daemon_pid(os.getpid(), self.port)
-        try:
+        # Use a temp PID file so the real DAEMON_PID_FILE is never touched
+        tmp_pid = os.path.join(tempfile.mkdtemp(prefix="ctxd-test-"), "sessions-api.pid")
+        with mock.patch("sessions.cli.DAEMON_PID_FILE", tmp_pid):
+            _write_daemon_pid(os.getpid(), self.port)
             # Mock ChromeManager.is_running to return True (Chrome is alive)
             with mock.patch("sessions.cli.ChromeManager") as MockCM:
                 MockCM.return_value.is_running.return_value = True
                 result = _reclaim_stale_chrome(9222)
-            # Should return True (reuse Chrome) without sending shutdown
-            self.assertTrue(result, "Should reuse Chrome, not try to shut down own daemon")
-        finally:
-            try:
-                os.remove(DAEMON_PID_FILE)
-            except OSError:
-                pass
+        # Should return True (reuse Chrome) without sending shutdown
+        self.assertTrue(result, "Should reuse Chrome, not try to shut down own daemon")
 
     def test_shutdown_from_python_urllib_is_startup_probe(self):
         """Verify that a Python-urllib User-Agent shutdown request is logged,

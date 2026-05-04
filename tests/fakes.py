@@ -308,6 +308,13 @@ class _PatchedManagerMixin:
 
         self.mgr._open_tab_with_storage = fake_open
 
+        # Patch raw HTTP helpers that bypass _browser_session so tests never
+        # contact the real Chrome on port 9222 or the real daemon on port 9999.
+        self.mgr._get_targets_cached = lambda max_age=2.0, _fb=self.fb: [
+            dict(t, id=t["targetId"]) for t in _fb.targets.values()
+        ]
+        self.mgr._chrome_http_reachable = lambda: False
+
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
