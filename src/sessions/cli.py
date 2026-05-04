@@ -345,19 +345,25 @@ def cmd_start(args) -> int:
             # does not mistake the missing old target for a user-close event
             # while Chrome is restarting.
             manager._dashboard_target_id = None
-            # 2. Restart Chrome
+            # 2. Kill hung Chrome (if any) before restart
             if not _chrome_ref:
                 log.error("recover_chrome: no ChromeManager ref, falling back to exit")
                 graceful_exit()
                 return
             chrome_mgr = _chrome_ref[0]
+            log.debug("recover_chrome: force-stopping Chrome before restart")
             try:
-                log.debug("recover_chrome: restarting Chrome")
-                chrome_mgr.start(headless=getattr(args, 'headless', False))
-                log.debug("recover_chrome: Chrome restarted")
+                chrome_mgr.stop(force=True)
             except Exception as e:
-                log.error("recover_chrome: Chrome restart failed (%s), falling back to exit", e)
-                graceful_exit()
+                log.debug("recover_chrome: Chrome stop error (expected if already dead): %s", e)
+            # 3. Restart Chrome with longer timeout (hung Chrome may take time to fully exit)
+            try:
+                log.debug("recover_chrome: restarting Chrome (30s timeout)")
+                chrome_mgr.start(headless=getattr(args, 'headless', False), timeout=30)
+                log.debug("recover_chrome: Chrome restarted successfully")
+            except Exception as e:
+                log.error("recover_chrome: Chrome restart failed (%s), will retry on next crash detection", e)
+                # Don't exit — let crash detection retry on the next cycle
                 return
             # 3. Reopen the dashboard tab
             if not getattr(args, 'no_browser_open', False):
