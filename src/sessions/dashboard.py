@@ -56,7 +56,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tabs { display:flex; flex-direction:column; }
   .tab { display:flex; align-items:center; gap:6px; padding:5px 10px;
          border-radius:4px; font-size:13px; color:#cbd5e1;
-         cursor:pointer; user-select:none; }
+         cursor:pointer; user-select:none; min-width:0; }
   .tab:hover, .tab.focused { background:#334155; }
   .tabs .tab:not(:last-child) { border-bottom:1px solid #0f172a; }
   /* row-level hover action buttons (Hibernate/Restore + Delete) */
@@ -71,10 +71,10 @@ DASHBOARD_HTML = r"""<!doctype html>
   /* tab-num removed — checkboxes replace numbering */
   .tab-body { flex:1; display:flex; align-items:center; gap:6px;
               overflow:hidden; min-width:0; order:1; }
-  .tab-title { flex:0 1 auto; overflow:hidden;
-               text-overflow:ellipsis; white-space:nowrap; }
+  .tab-title { flex:0 0 auto; overflow:hidden;
+               text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
   .tab-url { color:#64748b; overflow:hidden; text-overflow:ellipsis;
-             white-space:nowrap; flex:1 1 auto; font-size:12px; min-width:0; }
+             white-space:nowrap; flex:1 1 auto; font-size:12px; min-width:0; max-width:300px; }
   .tab-close { flex:0 0 auto; opacity:0; cursor:pointer; font-size:15px;
                padding:0 2px; order:3; }
   .tab:hover .tab-close { opacity:0.4; }
