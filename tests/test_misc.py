@@ -661,8 +661,10 @@ class TestDashboardDisconnectedBanner(unittest.TestCase):
 
     def test_faster_polling_when_disconnected(self):
         self.assertIn('_disconnected', self.html)
-        # Should have conditional interval logic
-        self.assertIn('_disconnected ? 1000 : 3000', self.html)
+        # Should have conditional interval logic (fast when disconnected)
+        self.assertIn('_POLL_DISCONNECTED', self.html)
+        self.assertIn('_POLL_CONNECTED', self.html)
+        self.assertIn('_disconnected ? _POLL_DISCONNECTED : _POLL_CONNECTED', self.html)
 
 
 if __name__ == "__main__":

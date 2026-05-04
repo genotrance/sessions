@@ -507,20 +507,6 @@ async function rowAction(action, cid) {
 }
 
 // ── API actions ───────────────────────────────────────────────────────────────
-async function refresh() {
-  try {
-    const data = await api('/api/containers');
-    if (_disconnected) { setDisconnected(false); toast('Reconnected'); }
-    const btn = document.getElementById('trim-log-btn');
-    if (btn) btn.style.display = data.debug_mode ? '' : 'none';
-    const j = JSON.stringify(data);
-    if (j === _lastJson) return;
-    _lastJson = j;
-    renderList(data);
-  } catch(e) {
-    if (!_disconnected) setDisconnected(true);
-  }
-}
 async function trimLog() {
   toast('Trimming log…');
   try {
@@ -587,13 +573,40 @@ async function quitDaemon() {
 }
 refresh();
 refocusSearch();
-// 1s tick when disconnected (fast reconnect), 3s when connected
+// Debounced refresh: coalesces rapid action-triggered calls into one request.
+// The timer-based poller also goes through this so there is at most one
+// in-flight /api/containers request at a time.
 let _lastPoll = 0;
+let _refreshPending = false;
+let _refreshInFlight = false;
+const _POLL_CONNECTED = 3000;
+const _POLL_DISCONNECTED = 1000;
+const _DEBOUNCE_MS = 200;
+async function refresh() {
+  if (_refreshPending) return;   // already scheduled
+  if (_refreshInFlight) { _refreshPending = true; return; }
+  _refreshPending = false;
+  _refreshInFlight = true;
+  _lastPoll = Date.now();
+  try {
+    const data = await api('/api/containers');
+    if (_disconnected) { setDisconnected(false); toast('Reconnected'); }
+    const btn = document.getElementById('trim-log-btn');
+    if (btn) btn.style.display = data.debug_mode ? '' : 'none';
+    const j = JSON.stringify(data);
+    if (j !== _lastJson) { _lastJson = j; renderList(data); }
+  } catch(e) {
+    if (!_disconnected) { setDisconnected(true); }
+  } finally {
+    _refreshInFlight = false;
+    if (_refreshPending) { _refreshPending = false; setTimeout(refresh, _DEBOUNCE_MS); }
+  }
+}
 setInterval(() => {
   const now = Date.now();
-  const interval = _disconnected ? 1000 : 3000;
-  if (now - _lastPoll >= interval) { _lastPoll = now; refresh(); }
-}, 1000);
+  const interval = _disconnected ? _POLL_DISCONNECTED : _POLL_CONNECTED;
+  if (now - _lastPoll >= interval) refresh();
+}, 500);
 </script>
 </body>
 </html>

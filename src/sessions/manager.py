@@ -76,6 +76,17 @@ IDB_PER_DB_TIMEOUT = 10
 IDB_TOTAL_BUDGET = 25
 # Timeout for the quick indexedDB.databases() metadata call.
 IDB_LIST_TIMEOUT = 5
+# IDB database names to skip during snapshot.  These are large cache/index
+# databases that are not needed for session restoration and consistently time
+# out, burning the entire IDB_TOTAL_BUDGET.  Auth state for these apps lives
+# in localStorage, not in these databases.
+_IDB_SKIP_NAMES: frozenset[str] = frozenset({
+    # WhatsApp: search index, job queue, media LRU cache, offline store
+    "fts-storage",
+    "jobs-storage",
+    "lru-media-storage-idb",
+    "offd-storage",
+})
 
 
 # Backward-compatible alias used by tests and scripts
@@ -246,7 +257,7 @@ class ContainerManager:
                 self._evt_thread.join(timeout=join_timeout)
 
     _FOCUS_POLL_INTERVAL = 2.0
-    _FOCUS_REBUILD_INTERVAL = 10.0
+    _FOCUS_REBUILD_INTERVAL = 30.0
 
     def _activation_event_loop(self) -> None:
         """Poll document.hasFocus() on each hot tab to track Chrome-native
@@ -734,6 +745,10 @@ class ContainerManager:
                         for db_info in db_list:
                             db_name = db_info.get("n") or ""
                             if not db_name:
+                                continue
+                            if db_name in _IDB_SKIP_NAMES:
+                                log.debug("idb: %s/%s skipped (known cache db)",
+                                          origin, db_name)
                                 continue
                             cache_key = f"{origin}\x00{db_name}"
                             elapsed = time.time() - idb_t0
