@@ -543,7 +543,7 @@ class TestCLIStopStatus(unittest.TestCase):
         urllib.request.urlopen is mocked to prevent any real HTTP call to the daemon."""
         import json as _json
         from sessions.cli import cmd_stop
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
         import io
         pid_file = os.path.join(self.tmp, "sessions-api.pid")
         with open(pid_file, "w") as f:
