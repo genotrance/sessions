@@ -176,6 +176,14 @@ class PersistenceManager:
             c.execute("UPDATE containers SET is_active=? WHERE id=?",
                       (1 if active else 0, cid))
 
+    def mark_active_bulk(self, cids: list[str], active: bool) -> None:
+        if not cids:
+            return
+        val = 1 if active else 0
+        with self._lock, self._conn() as c:
+            c.executemany("UPDATE containers SET is_active=? WHERE id=?",
+                          [(val, cid) for cid in cids])
+
     def clear_tabs(self, cid: str) -> None:
         with self._lock, self._conn() as c:
             c.execute("DELETE FROM container_tabs WHERE container_id=?", (cid,))

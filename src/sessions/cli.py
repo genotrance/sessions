@@ -324,7 +324,9 @@ def cmd_start(args) -> int:
 
     def recover_chrome():
         """Called when Chrome is confirmed dead while the backend is running.
-        Restarts Chrome and restores all previously hot containers."""
+        Restarts Chrome and restores containers that are still marked active
+        in the DB.  Containers that a bulk operation already marked inactive
+        (recording the user's intent) are left hibernated."""
         if not _recovering.acquire(blocking=False):
             log.debug("recover_chrome: already in progress, skipping")
             return
@@ -332,15 +334,29 @@ def cmd_start(args) -> int:
             if stop_evt.is_set():
                 return
             log.warning("recover_chrome: Chrome died unexpectedly, attempting restart")
-            # 1. Snapshot hot container IDs and mark them cold
+            # 1. Clear in-memory hot map (browser contexts are gone) and
+            #    check DB is_active to learn which containers the user
+            #    intended to keep alive vs. those already marked for
+            #    hibernation by a bulk operation.
             with manager._lock:
                 hot_cids = list(manager.hot.keys())
                 manager.hot.clear()
+            db_active = {c["id"] for c in manager.store.list_containers()
+                         if c.get("is_active")}
+            restore_cids = [c for c in hot_cids if c in db_active]
+            skip_cids = [c for c in hot_cids if c not in db_active]
             for cid in hot_cids:
                 manager._last_snapshot_time.pop(cid, None)
                 manager._last_snapshot_hash.pop(cid, None)
-                manager.store.mark_active(cid, False)
+            # Mark genuinely-active containers inactive while Chrome is down
+            # (restore() will re-mark them active).
+            if restore_cids:
+                manager.store.mark_active_bulk(restore_cids, False)
             manager._invalidate_browser_session()
+            if skip_cids:
+                log.debug("recover_chrome: skipping %d containers already "
+                          "marked inactive (user intent): %s",
+                          len(skip_cids), skip_cids)
             # Clear the stale dashboard target ID so _check_dashboard_alive
             # does not mistake the missing old target for a user-close event
             # while Chrome is restarting.
@@ -365,18 +381,19 @@ def cmd_start(args) -> int:
                 log.error("recover_chrome: Chrome restart failed (%s), will retry on next crash detection", e)
                 # Don't exit — let crash detection retry on the next cycle
                 return
-            # 3. Reopen the dashboard tab
+            # 4. Reopen the dashboard tab
             if not getattr(args, 'no_browser_open', False):
                 manager.open_dashboard_in_default_tab(dash_url)
-            # 4. Restore all previously hot containers
-            for cid in hot_cids:
+            # 5. Restore containers that were genuinely active
+            for cid in restore_cids:
                 try:
                     log.debug("recover_chrome: restoring container %s", cid)
                     manager.restore(cid)
                 except Exception as e:
                     log.warning("recover_chrome: restore %s failed: %s", cid, e)
-            log.warning("recover_chrome: recovery complete, %d containers restored",
-                        len(hot_cids))
+            log.warning("recover_chrome: recovery complete, %d restored, "
+                        "%d left hibernated",
+                        len(restore_cids), len(skip_cids))
         except Exception as e:
             log.error("recover_chrome: unexpected error: %s", e)
             graceful_exit()

@@ -280,6 +280,39 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
         result = self.mgr.activate_tab(tid)
         self.assertTrue(result["activated"])
 
+    def test_clean_clears_live_storage_in_chrome(self):
+        """clean() on a hot session should clear localStorage + IndexedDB
+        from all live tabs in Chrome, not just the DB."""
+        c = self.store.create_container("clean-live")
+        self.store.save_hibernation(
+            c["id"],
+            [{"name": "auth", "value": "token", "domain": "clean.com",
+              "path": "/", "url": "https://clean.com"}],
+            {"https://clean.com": {"key": "value"}},
+            [{"url": "https://clean.com/app", "title": "App"}])
+        self.mgr.restore(c["id"])
+        ctx = self.mgr.hot[c["id"]]
+        # Seed localStorage in the fake browser
+        for t in self.fb.targets.values():
+            if t["browserContextId"] == ctx:
+                self.fb.local_storage[t["targetId"]] = {
+                    "https://clean.com": {"key": "value"}}
+        # Clean should clear cookies + storage in Chrome
+        result = self.mgr.clean(c["id"])
+        self.assertTrue(result["cleaned"])
+        # Session should still be hot
+        self.assertIn(c["id"], self.mgr.hot)
+        # DB should be wiped
+        full = self.store.get_container(c["id"])
+        self.assertEqual(full["cookies"], [])
+        self.assertEqual(full["storage"], {})
+        # Live storage should be cleared (FakeBrowser simulates this via evaluate calls)
+        for t in self.fb.targets.values():
+            if t["browserContextId"] == ctx:
+                tid = t["targetId"]
+                # FakeBrowser clears local_storage when localStorage.clear() is evaluated
+                self.assertEqual(self.fb.local_storage.get(tid, {}).get("https://clean.com", {}), {})
+
     def test_snapshot_saves_without_disposing(self):
         c = self.store.create_container("snap")
         self.store.save_hibernation(
@@ -470,6 +503,101 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
         urls = [t["url"] for t in full["tabs"]]
         self.assertIn("https://keep.com/a", urls)
         self.assertIn("https://keep.com/b", urls)
+
+
+# ---------------------------------------------------------------------------
+# Bulk operations
+# ---------------------------------------------------------------------------
+
+class TestBulkOperations(_PatchedManagerMixin, unittest.TestCase):
+
+    def test_bulk_hibernate_marks_inactive_before_processing(self):
+        """bulk_hibernate should mark all targets inactive in DB before doing
+        any CDP work, so crash recovery honours user intent."""
+        ids = []
+        for name in ("bh1", "bh2", "bh3"):
+            c = self.store.create_container(name)
+            self.store.save_hibernation(
+                c["id"], [], {},
+                [{"url": f"https://{name}.com", "title": name}])
+            self.mgr.restore(c["id"])
+            ids.append(c["id"])
+        # All should be active
+        for cid in ids:
+            self.assertEqual(self.store.get_container(cid)["is_active"], 1)
+        results = self.mgr.bulk_hibernate(ids)
+        self.assertEqual(len(results), 3)
+        for cid in ids:
+            self.assertNotIn(cid, self.mgr.hot)
+            self.assertEqual(self.store.get_container(cid)["is_active"], 0)
+
+    def test_bulk_hibernate_skips_cold_containers(self):
+        c = self.store.create_container("cold-skip")
+        self.store.save_hibernation(
+            c["id"], [], {},
+            [{"url": "https://cold.com", "title": "Cold"}])
+        results = self.mgr.bulk_hibernate([c["id"]])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["skipped"], "already-cold")
+
+    def test_bulk_hibernate_crash_midway_leaves_intent(self):
+        """If Chrome dies mid-bulk-hibernate, containers already marked
+        inactive in the DB should NOT be re-activated."""
+        ids = []
+        for name in ("crash-a", "crash-b"):
+            c = self.store.create_container(name)
+            self.store.save_hibernation(
+                c["id"], [], {},
+                [{"url": f"https://{name}.com", "title": name}])
+            self.mgr.restore(c["id"])
+            ids.append(c["id"])
+        # Simulate Chrome crash on the first hibernate call
+        orig_hibernate = self.mgr.hibernate
+        call_count = [0]
+        def _crash_on_first(cid):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("Chrome dead")
+            return orig_hibernate(cid)
+        self.mgr.hibernate = _crash_on_first
+        results = self.mgr.bulk_hibernate(ids)
+        # Both should be marked inactive in DB (intent recorded before CDP)
+        for cid in ids:
+            self.assertEqual(self.store.get_container(cid)["is_active"], 0)
+        # First errored, second succeeded
+        errors = [r for r in results if "error" in r]
+        self.assertEqual(len(errors), 1)
+
+    def test_bulk_clean(self):
+        ids = []
+        for name in ("cl1", "cl2"):
+            c = self.store.create_container(name)
+            self.store.save_hibernation(
+                c["id"],
+                [{"name": "k", "value": "v", "domain": f"{name}.com",
+                  "path": "/", "url": f"https://{name}.com"}],
+                {f"https://{name}.com": {"d": "v"}},
+                [{"url": f"https://{name}.com", "title": name}])
+            ids.append(c["id"])
+        results = self.mgr.bulk_clean(ids)
+        self.assertEqual(len(results), 2)
+        for cid in ids:
+            full = self.store.get_container(cid)
+            self.assertEqual(full["cookies"], [])
+            self.assertEqual(full["storage"], {})
+
+    def test_bulk_delete(self):
+        ids = []
+        for name in ("del1", "del2"):
+            c = self.store.create_container(name)
+            self.store.save_hibernation(
+                c["id"], [], {},
+                [{"url": f"https://{name}.com", "title": name}])
+            ids.append(c["id"])
+        results = self.mgr.bulk_delete(ids)
+        self.assertEqual(len(results), 2)
+        for cid in ids:
+            self.assertIsNone(self.store.get_container(cid))
 
 
 # ---------------------------------------------------------------------------

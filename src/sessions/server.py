@@ -84,6 +84,15 @@ class _ApiHandler(BaseHTTPRequestHandler):
             return self._send_json(self.manager.close_tab(tid))
         if method == "POST" and path == "/api/hibernate-all":
             return self._send_json({"results": self.manager.hibernate_all()})
+        if method == "POST" and path == "/api/bulk-hibernate":
+            ids = self._body().get("ids", [])
+            return self._send_json({"results": self.manager.bulk_hibernate(ids)})
+        if method == "POST" and path == "/api/bulk-clean":
+            ids = self._body().get("ids", [])
+            return self._send_json({"results": self.manager.bulk_clean(ids)})
+        if method == "POST" and path == "/api/bulk-delete":
+            ids = self._body().get("ids", [])
+            return self._send_json({"results": self.manager.bulk_delete(ids)})
         if method == "POST" and path == "/api/snapshot-all":
             return self._send_json({"results": self.manager.snapshot_all()})
         if method == "POST" and path == "/api/shutdown":

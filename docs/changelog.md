@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-05-08
+
+### Fixed
+
+- **Crash-safe bulk operations**: Bulk hibernate, clean, and delete now send all selected session IDs in a single API call. User intent is recorded in the database before any Chrome work begins, so if Chrome crashes mid-operation, sessions you asked to hibernate stay hibernated instead of being restored.
+- **Clean wipes live browser data**: Cleaning a running session now clears cookies, localStorage, and IndexedDB from the actual Chrome tabs (not just the backend database), so the session behaves like a fresh start without needing to restart it.
+
 ## [0.1.0] - 2026-04-29
 
 ### Added

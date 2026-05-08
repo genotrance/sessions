@@ -228,13 +228,19 @@ async function bulkAct(action) {
   const doneLabel = {restore:'Restored',hibernate:'Hibernated',clean:'Cleaned',delete:'Deleted'}[action]||action;
   const ids = [...selected]; let count = 0;
   toast(`${label} ${ids.length} session(s)…`);
-  for (const id of ids) {
+  const bulkActions = {hibernate:1, clean:1, delete:1};
+  if (bulkActions[action]) {
     try {
-      if (action === 'delete') await api(`/api/containers/${id}`, 'DELETE');
-      else if (action === 'clean') await api(`/api/containers/${id}/clean`, 'POST');
-      else await api(`/api/containers/${id}/${action}`, 'POST');
-      count++;
+      const res = await api(`/api/bulk-${action}`, 'POST', {ids});
+      count = (res.results||[]).filter(r => !r.error).length;
     } catch(e) {}
+  } else {
+    for (const id of ids) {
+      try {
+        await api(`/api/containers/${id}/${action}`, 'POST');
+        count++;
+      } catch(e) {}
+    }
   }
   selected.clear(); updateBulkBar();
   toast(`${doneLabel} ${count} session(s)`);

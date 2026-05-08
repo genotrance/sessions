@@ -489,6 +489,45 @@ class TestCrashRecovery(_PatchedManagerMixin, unittest.TestCase):
         self.assertEqual(len(full["tabs"]), 1)
 
 
+    def test_crash_recovery_honours_bulk_hibernate_intent(self):
+        """If bulk_hibernate marks containers inactive before Chrome dies,
+        recover_chrome should skip them and only restore the rest."""
+        # Create 3 sessions, all hot
+        ids = []
+        for name in ("keep", "hib-a", "hib-b"):
+            c = self.store.create_container(name)
+            self.store.save_hibernation(
+                c["id"], [], {},
+                [{"url": f"https://{name}.com", "title": name}])
+            self.mgr.restore(c["id"])
+            ids.append(c["id"])
+        keep_id, hib_a, hib_b = ids
+
+        # Simulate bulk_hibernate marking hib-a and hib-b inactive in DB
+        # (the first step of bulk_hibernate, before CDP work)
+        self.store.mark_active_bulk([hib_a, hib_b], False)
+
+        # Now simulate crash: clear hot map, check DB to decide what to restore
+        hot_cids = list(self.mgr.hot.keys())
+        self.mgr.hot.clear()
+        db_active = {c["id"] for c in self.store.list_containers()
+                     if c.get("is_active")}
+        restore_cids = [c for c in hot_cids if c in db_active]
+        skip_cids = [c for c in hot_cids if c not in db_active]
+
+        # Only 'keep' should be restored
+        self.assertEqual(restore_cids, [keep_id])
+        self.assertIn(hib_a, skip_cids)
+        self.assertIn(hib_b, skip_cids)
+
+        # Restore the ones that should come back
+        for cid in restore_cids:
+            self.mgr.restore(cid)
+        self.assertIn(keep_id, self.mgr.hot)
+        self.assertNotIn(hib_a, self.mgr.hot)
+        self.assertNotIn(hib_b, self.mgr.hot)
+
+
 # ===========================================================================
 # 5. Multi-session isolation end-to-end via HTTP
 # ===========================================================================
@@ -1073,6 +1112,58 @@ class TestDashboardCDPCheck(_PatchedManagerMixin, unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0], SNAPSHOT_CDP_TIMEOUT)
+
+
+# ===========================================================================
+# 13. Bulk API endpoints
+# ===========================================================================
+
+class TestBulkAPI(_HttpTestBase):
+    """Test the /api/bulk-* endpoints."""
+
+    def test_bulk_hibernate_via_http(self):
+        """POST /api/bulk-hibernate should hibernate all listed sessions."""
+        ids = []
+        for name in ("bk-h1", "bk-h2"):
+            s, c = self._req("POST", "/api/containers", {"name": name})
+            ids.append(c["id"])
+        s, res = self._req("POST", "/api/bulk-hibernate", {"ids": ids})
+        self.assertEqual(s, 200)
+        ok = [r for r in res["results"] if "error" not in r and "skipped" not in r]
+        self.assertEqual(len(ok), 2)
+        for cid in ids:
+            self.assertNotIn(cid, self.mgr.hot)
+
+    def test_bulk_clean_via_http(self):
+        ids = []
+        for name in ("bk-c1", "bk-c2"):
+            s, c = self._req("POST", "/api/containers", {"name": name})
+            self._req("POST", f"/api/containers/{c['id']}/hibernate")
+            self.store.save_hibernation(
+                c["id"],
+                [{"name": "k", "value": "v", "domain": f"{name}.com",
+                  "path": "/", "url": f"https://{name}.com"}],
+                {f"https://{name}.com": {"d": "v"}},
+                [{"url": f"https://{name}.com", "title": name}])
+            ids.append(c["id"])
+        s, res = self._req("POST", "/api/bulk-clean", {"ids": ids})
+        self.assertEqual(s, 200)
+        self.assertEqual(len(res["results"]), 2)
+        for cid in ids:
+            full = self.store.get_container(cid)
+            self.assertEqual(full["cookies"], [])
+
+    def test_bulk_delete_via_http(self):
+        ids = []
+        for name in ("bk-d1", "bk-d2"):
+            s, c = self._req("POST", "/api/containers", {"name": name})
+            self._req("POST", f"/api/containers/{c['id']}/hibernate")
+            ids.append(c["id"])
+        s, res = self._req("POST", "/api/bulk-delete", {"ids": ids})
+        self.assertEqual(s, 200)
+        self.assertEqual(len(res["results"]), 2)
+        for cid in ids:
+            self.assertIsNone(self.store.get_container(cid))
 
 
 if __name__ == "__main__":

@@ -208,6 +208,16 @@ class _FakeRuntimeDomain:
             from urllib.parse import urlparse
             p = urlparse(url)
             return f"{p.scheme}://{p.netloc}" if p.scheme else "null"
+        # localStorage.clear() — wipe storage for this tab
+        if "localStorage.clear()" in expression:
+            if self.tid in self.fb.local_storage:
+                self.fb.local_storage[self.tid] = {}
+            return None
+        # indexedDB.deleteDatabase() — wipe all IDB for this tab
+        if "indexedDB.deleteDatabase" in expression:
+            if self.tid in self.fb.idb_storage:
+                self.fb.idb_storage[self.tid] = {}
+            return None
         if "localStorage" in expression:
             store = self.fb.local_storage.get(self.tid, {})
             if store:

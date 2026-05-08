@@ -56,7 +56,7 @@ pip install -e .
 - **Hibernate** (pause icon) — Saves the session's tabs, cookies, and site data, then closes its browser window to free memory.
 - **Restore** (play icon) — Brings a hibernated session back with all its tabs and logins intact.
 - **Delete** (trash icon) — Permanently removes a session and all its saved data.
-- **Clean** — Clears cookies and storage for the default browser context.
+- **Clean** — Wipes cookies, localStorage, and IndexedDB for a session. For running sessions, data is cleared in the live browser so it behaves like a fresh session without needing to restart.
 - **Restart** — Restarts the Sessions backend while keeping Chrome running.
 - **Quit** — Saves all sessions and shuts down both the backend and Chrome.
 
@@ -79,7 +79,7 @@ Right-click any session for a context menu with **Restore**, **Hibernate**, **Cl
 - **Auto-save** — Running sessions are periodically snapshotted so nothing is lost if Chrome crashes.
 - **Auto-hibernate** — Closing a browser window automatically hibernates the session.
 - **Tab restoration** — Hibernated sessions restore all tabs with their original URLs and site data.
-- **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work.
+- **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Bulk operations in progress (e.g. hibernate) are honoured — sessions you asked to hibernate stay hibernated.
 - **Cross-platform** — Works on Windows, macOS, and Linux with Chrome or Edge.
 - **Dashboard UI** — A lightweight web dashboard for managing sessions from any tab.
 - **Keyboard hotkey** — Press `Win+/` (Windows) or `Ctrl+/` (macOS/Linux) to open the dashboard instantly. Disable with `--no-hotkey` if it conflicts with other software.

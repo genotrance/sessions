@@ -1257,21 +1257,47 @@ class ContainerManager:
     def clean(self, cid: str) -> dict:
         """Wipe cookies + storage while preserving the session.
 
-        Hot sessions: clear cookies via CDP on the live context (session keeps
-        running), then wipe the stored blobs in the DB.
+        Hot sessions: clear cookies via CDP, clear localStorage + IndexedDB
+        from all live tabs (so the session behaves like brand new in Chrome),
+        then wipe the stored blobs in the DB.
         Cold sessions: just wipe the stored blobs in the DB (tabs preserved).
         """
         log.debug("clean cid=%s", cid)
         with self._lock:
             ctx = self.hot.get(cid)
         if ctx:
-            log.debug("clean: clearing cookies for live ctx=%s", ctx)
+            log.debug("clean: clearing cookies + storage for live ctx=%s", ctx)
             try:
                 with self._new_browser_session() as bs:
                     bs.storage.clear_cookies(browser_context_id=ctx)
                     log.debug("clean: cookies cleared for ctx=%s", ctx)
+                    # Clear localStorage + IndexedDB from all tabs in this context
+                    all_targets = bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT)
+                    ctx_tids = [t["targetId"] for t in all_targets
+                                if t.get("browserContextId") == ctx
+                                and t.get("type") == "page"]
+                    cleared = 0
+                    for tid in ctx_tids:
+                        try:
+                            with self._tab_session(tid) as ts:
+                                # Clear localStorage
+                                ts.runtime.evaluate(
+                                    "try{localStorage.clear()}catch(e){}",
+                                    timeout=2)
+                                # Clear IndexedDB: delete all databases
+                                ts.runtime.evaluate(
+                                    "(async()=>{try{const dbs=await indexedDB.databases();"
+                                    "for(const db of dbs){indexedDB.deleteDatabase(db.name);}"
+                                    "}catch(e){}})()",
+                                    await_promise=True, timeout=5)
+                                cleared += 1
+                        except Exception as e:
+                            log.debug("clean: tab %s storage clear error (ignored): %s",
+                                      tid, e)
+                    log.debug("clean: storage cleared in %d/%d tabs for ctx=%s",
+                              cleared, len(ctx_tids), ctx)
             except Exception as e:
-                log.debug("clean: CDP clear_cookies error (ignored): %s", e)
+                log.debug("clean: CDP clear error (ignored): %s", e)
         self.store.clean_container(cid)
         log.debug("clean: done cid=%s (hot=%s)", cid, ctx is not None)
         return {"id": cid, "cleaned": True}
@@ -1303,10 +1329,51 @@ class ContainerManager:
             log.debug("delete: done cid=%s", cid)
 
     def hibernate_all(self) -> list[dict]:
-        results = []
-        for cid in list(self.hot.keys()):
+        return self.bulk_hibernate(list(self.hot.keys()))
+
+    def bulk_hibernate(self, cids: list[str]) -> list[dict]:
+        """Hibernate multiple containers.  Marks all as inactive in the DB
+        atomically *first* so that if Chrome crashes mid-way the user's intent
+        is preserved and recover_chrome won't re-open them."""
+        hot_cids = [c for c in cids if c in self.hot]
+        cold_cids = [c for c in cids if c not in self.hot]
+        if hot_cids:
+            log.debug("bulk_hibernate: marking %d containers inactive in DB "
+                      "before CDP work: %s", len(hot_cids), hot_cids)
+            self.store.mark_active_bulk(hot_cids, False)
+        results: list[dict] = []
+        for cid in cold_cids:
+            results.append({"id": cid, "skipped": "already-cold"})
+        for cid in hot_cids:
             try:
                 results.append(self.hibernate(cid))
+            except Exception as e:
+                log.debug("bulk_hibernate: %s failed: %s", cid, e)
+                with self._lock:
+                    self.hot.pop(cid, None)
+                self._last_snapshot_hash.pop(cid, None)
+                self._last_snapshot_time.pop(cid, None)
+                results.append({"id": cid, "error": str(e)})
+        return results
+
+    def bulk_clean(self, cids: list[str]) -> list[dict]:
+        """Clean multiple containers."""
+        results: list[dict] = []
+        for cid in cids:
+            try:
+                results.append(self.clean(cid))
+            except Exception as e:
+                results.append({"id": cid, "error": str(e)})
+        return results
+
+    def bulk_delete(self, cids: list[str]) -> list[dict]:
+        """Delete multiple containers.  Removes DB records first so intent is
+        captured even if Chrome crashes during context disposal."""
+        results: list[dict] = []
+        for cid in cids:
+            try:
+                self.delete(cid)
+                results.append({"id": cid, "deleted": True})
             except Exception as e:
                 results.append({"id": cid, "error": str(e)})
         return results
