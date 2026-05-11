@@ -8,8 +8,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, system-ui, Segoe UI, sans-serif;
-         margin: 0; padding: 0; background: #0f172a; color: #e2e8f0;
-         font-size: 14px; }
+         margin: 0 auto; padding: 0; background: #0f172a; color: #e2e8f0;
+         font-size: 14px; max-width: 90%; }
   .sticky-header { position:sticky; top:0; z-index:100; background:#0f172a;
                    padding:16px 16px 0; }
   h1 { margin: 0 0 12px; font-size: 19px; display:flex; align-items:center;
@@ -41,7 +41,12 @@ DASHBOARD_HTML = r"""<!doctype html>
                   font-size:16px; cursor:pointer; padding:0 4px; line-height:1; }
   #search-clear:hover { color:#e2e8f0; }
   /* session list */
-  .list { display:flex; flex-direction:column; gap:4px; padding:8px 16px 16px; }
+  .list { display:grid; grid-template-columns:1fr 1fr; gap:0 16px;
+         padding:8px 16px 16px; align-items:start; }
+  .col { display:flex; flex-direction:column; gap:6px; }
+  .col-header { font-size:11px; color:#64748b; text-transform:uppercase;
+                letter-spacing:0.05em; padding:2px 4px 4px; font-weight:600; }
+  .col-empty { color:#334155; font-size:12px; font-style:italic; padding:4px 10px; }
   .row { background:#1e293b; border:1px solid #334155; border-radius:6px;
          border-left:3px solid #334155; transition:border-color 0.2s; }
   .row.hot  { border-left-color:#22c55e; }
@@ -60,33 +65,58 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tab:hover, .tab.focused { background:#334155; }
   .tabs .tab:not(:last-child) { border-bottom:1px solid #0f172a; }
   /* row-level hover action buttons (Hibernate/Restore + Delete) */
-  .row-actions { display:flex; gap:2px; flex:0 0 auto; opacity:0;
-                 transition:opacity 0.15s; order:2; }
+  .row-actions { display:inline-flex; gap:2px; flex:0 0 auto; opacity:0;
+                 transition:opacity 0.15s; }
   .row:hover .row-actions { opacity:1; }
+  .row-actions .row-action { opacity:1; }
+  .row-actions .action-sep { opacity:0.6; }
   .row-action { display:flex; align-items:center; justify-content:center;
                 width:26px; height:26px; border-radius:4px;
-                cursor:pointer; color:#64748b; transition:color 0.15s, background 0.15s; }
+                cursor:pointer; color:#64748b; opacity:0;
+                transition:opacity 0.15s, color 0.15s, background 0.15s; }
+  .tab:hover .row-action { opacity:1; }
   .row-action:hover { background:#475569; color:#e2e8f0; }
   .row-action.danger:hover { color:#f87171; background:#3b1818; }
+  .action-sep { width:1px; height:16px; background:#475569; margin:0 2px; flex:0 0 auto;
+                opacity:0; transition:opacity 0.15s; }
+  .tab:hover .action-sep { opacity:0.6; }
   /* tab-num removed — checkboxes replace numbering */
   .tab-body { flex:1; display:flex; align-items:center; gap:6px;
-              overflow:hidden; min-width:0; order:1; }
+              overflow:hidden; min-width:0; }
   .tab-title { flex:0 0 auto; overflow:hidden;
                text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
   .tab-url { color:#64748b; overflow:hidden; text-overflow:ellipsis;
              white-space:nowrap; flex:1 1 auto; font-size:12px; min-width:0; max-width:300px; }
   .tab-close { flex:0 0 auto; opacity:0; cursor:pointer; font-size:15px;
-               padding:0 2px; order:3; }
+               padding:0 2px; }
   .tab:hover .tab-close { opacity:0.4; }
   .tab-close:hover { opacity:1 !important; color:#f87171; }
+  /* cut/paste mode */
+  .tab.cut-active { background:#7c3aed33; outline:1px solid #7c3aed; }
+  .paste-target { cursor:pointer; animation:pastePulse 1.5s infinite; }
+  .paste-target:hover { outline:2px solid #7c3aed; outline-offset:-2px; }
+  @keyframes pastePulse { 0%,100%{border-left-color:#7c3aed} 50%{border-left-color:#a78bfa} }
+  .paste-btn { display:inline-flex; align-items:center; justify-content:center;
+               width:26px; height:26px; border-radius:4px;
+               cursor:pointer; color:#a78bfa; transition:color 0.15s, background 0.15s;
+               flex:0 0 auto; }
+  .paste-btn:hover { background:#7c3aed33; color:#e2e8f0; }
+  .tab-cut { flex:0 0 auto; opacity:0; cursor:pointer; font-size:13px;
+             padding:0 2px; color:#64748b; }
+  .tab:hover .tab-cut { opacity:0.5; }
+  .tab-cut:hover { opacity:1 !important; color:#a78bfa; }
   /* empty session row */
   .row-empty { display:flex; align-items:center; gap:8px; padding:6px 10px;
-               cursor:default; user-select:none; color:#475569; font-size:13px; }
+               cursor:default; user-select:none; color:#475569; font-size:13px;
+               min-width:0; }
+  .row-empty .row-actions { margin-left:auto; }
   /* search results */
   .search-row { background:#1e293b; border:1px solid #334155; border-radius:6px;
                 display:flex; align-items:center; gap:8px; padding:6px 10px;
                 cursor:pointer; }
   .search-row:hover, .search-row.focused { background:#334155; }
+  .search-hot { border-left:3px solid #22c55e; }
+  .search-cold { border-left:3px solid #f59e0b; }
   .search-session { font-size:12px; color:#64748b; flex:0 0 auto;
                     min-width:24px; text-align:right; }
   /* context menu */
@@ -166,11 +196,15 @@ let _disconnected = false;
 // browseFocusIdx: for arrow-key navigation in the normal (non-search) list
 let _browseFocusIdx = -1;
 let _browseItems = [];   // flat [{c, t}] built from last renderList
+// cut/paste state
+let _cutTab = null;  // {cid, url, targetId, isHot}
 
 // ── icons ────────────────────────────────────────────────────────────────────
 const _svgPause = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M5 2h2v12H5zM9 2h2v12H9z"/></svg>';
 const _svgPlay  = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M4 2l10 6-10 6z"/></svg>';
 const _svgTrash = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M6 1a.5.5 0 00-.5.5V2H3v1h10V2h-2.5v-.5A.5.5 0 0010 1H6zM4.5 5l.5 8.5a1 1 0 001 .5h4a1 1 0 001-.5L11.5 5h-7z"/></svg>';
+const _svgCut   = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>';
+const _svgPaste = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/></svg>';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function toast(msg, ms=2500) {
@@ -302,7 +336,7 @@ document.addEventListener('click', e => {
   if (!e.target.closest('#ctx-menu')) closeCtxMenu();
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeCtxMenu(); clearSearch(); }
+  if (e.key === 'Escape') { closeCtxMenu(); if (_cutTab) { cancelCut(); return; } clearSearch(); }
 });
 
 // ── render session list ───────────────────────────────────────────────────────
@@ -312,6 +346,7 @@ function rowActionsHtml(c) {
     + `<span class="row-action" title="${isHot?'Hibernate':'Restore'}" `
     + `onclick="event.stopPropagation();rowAction('${isHot?'hibernate':'restore'}','${esc(c.id)}')">`
     + `${isHot?_svgPause:_svgPlay}</span>`
+    + `<span class=action-sep></span>`
     + `<span class="row-action danger" title="Delete" `
     + `onclick="event.stopPropagation();rowAction('delete','${esc(c.id)}')">`
     + `${_svgTrash}</span></span>`;
@@ -321,21 +356,63 @@ function makeTabRow(c, t, isFirst) {
   const isBlank = !t.url || t.url === 'about:blank';
   const displayTitle = isBlank ? 'New Tab' : esc(t.title || trimUrl(t.url));
   const displayUrl   = isBlank ? '' : esc(trimUrl(t.url));
-  const clickAction = isHot
-    ? `activate('${esc(t.targetId)}');refocusSearch()`
-    : `restoreAndOpen('${esc(c.id)}','${esc(t.url)}');refocusSearch()`;
+  const clickAction = `if(_cutTab&&_cutTab.cid!=='${esc(c.id)}'){pasteTab('${esc(c.id)}');return;}`
+    + (isHot
+      ? `activate('${esc(t.targetId)}');refocusSearch()`
+      : `restoreAndOpen('${esc(c.id)}','${esc(t.url)}');refocusSearch()`);
   const closeAction = isHot
     ? `closeTab('${esc(t.targetId)}')`
     : `deleteSavedTab('${esc(c.id)}','${esc(t.url)}')`;
-  return `<div class="tab"
+  const cutAction = `cutTab('${esc(c.id)}','${esc(t.url)}','${esc(t.targetId||'')}',${isHot})`;
+  const isCut = _cutTab && _cutTab.cid === c.id && _cutTab.url === t.url;
+  const hibernateBtn = isFirst
+    ? `<span class="row-action" title="${isHot?'Hibernate':'Restore'}" `
+      + `onclick="event.stopPropagation();rowAction('${isHot?'hibernate':'restore'}','${esc(c.id)}')">`
+      + `${isHot?_svgPause:_svgPlay}</span>`
+    : '';
+  const deleteBtn = isFirst
+    ? `<span class="row-action danger" title="Delete" `
+      + `onclick="event.stopPropagation();rowAction('delete','${esc(c.id)}')">`
+      + `${_svgTrash}</span>`
+    : '';
+  return `<div class="tab${isCut?' cut-active':''}"
                onclick="event.stopPropagation();${clickAction}">
     <div class=tab-body>
       <span class=tab-title${isBlank?' style="color:#94a3b8"':''}>${displayTitle}</span>
       <span class=tab-url>${displayUrl}</span>
     </div>
-    ${isFirst ? rowActionsHtml(c) : ''}
+    ${hibernateBtn}
+    <span class=tab-cut title="Cut — move to another session" onclick="event.stopPropagation();${cutAction}">${_svgCut}</span>
+    <span class=action-sep></span>
+    ${deleteBtn}
     <span class=tab-close onclick="event.stopPropagation();${closeAction}">&times;</span>
   </div>`;
+}
+
+function _buildRow(c) {
+  const el = document.createElement('div');
+  el.className = 'row ' + (c.hot ? 'hot' : 'cold') + (selected.has(c.id) ? ' selected' : '');
+  el.dataset.id = c.id;
+  el.dataset.hot = c.hot ? '1' : '';
+  el.addEventListener('contextmenu', e => showCtxMenu(e, c.id, c.hot));
+  const isPasteTarget = _cutTab && _cutTab.cid !== c.id;
+  if (isPasteTarget) el.classList.add('paste-target');
+  const tabs = c.hot ? (c.live_tabs||[]) : (c.saved_tabs||[]);
+  let tabsHtml = '';
+  const pasteHtml = isPasteTarget
+    ? `<span class=paste-btn title="Paste tab here" onclick="event.stopPropagation();pasteTab('${esc(c.id)}')">${_svgPaste}</span>`
+    : '';
+  if (tabs.length) {
+    tabs.forEach((t, ti) => { tabsHtml += makeTabRow(c, t, ti===0); });
+  } else {
+    tabsHtml = `<div class=row-empty><span style="color:#475569">${c.hot?'no tabs':'hibernated'}</span>${pasteHtml}${rowActionsHtml(c)}</div>`;
+  }
+  const cbChecked = selected.has(c.id) ? ' checked' : '';
+  el.innerHTML = `<div style="display:flex"><div class=row-cb><input type=checkbox${cbChecked} onchange="toggleSelect('${esc(c.id)}',this)"></div><div class=tabs style="flex:1">${tabsHtml}</div></div>`;
+  if (isPasteTarget) el.addEventListener('click', e => {
+    if (!e.target.closest('.tab') && !e.target.closest('input')) pasteTab(c.id);
+  });
+  return el;
 }
 
 function renderList(data) {
@@ -346,27 +423,24 @@ function renderList(data) {
   g.innerHTML = '';
   _allIds = data.containers.map(c => c.id);
   _browseItems = [];
-  data.containers.forEach((c, idx) => {
-    const el = document.createElement('div');
-    el.className = 'row ' + (c.hot ? 'hot' : 'cold') + (selected.has(c.id) ? ' selected' : '');
-    el.dataset.id  = c.id;
-    el.dataset.hot = c.hot ? '1' : '';
-    el.addEventListener('contextmenu', e => showCtxMenu(e, c.id, c.hot));
-
+  const hot = data.containers.filter(c => c.hot);
+  const cold = data.containers.filter(c => !c.hot);
+  [...hot, ...cold].forEach(c => {
     const tabs = c.hot ? (c.live_tabs||[]) : (c.saved_tabs||[]);
-    let tabsHtml = '';
-    if (tabs.length) {
-      tabs.forEach((t, ti) => {
-        _browseItems.push({c, t});
-        tabsHtml += makeTabRow(c, t, ti===0);
-      });
-    } else {
-      tabsHtml = `<div class=row-empty><span style="color:#475569">${c.hot?'no tabs':'hibernated'}</span>${rowActionsHtml(c)}</div>`;
-    }
-    const cbChecked = selected.has(c.id) ? ' checked' : '';
-    el.innerHTML = `<div style="display:flex"><div class=row-cb><input type=checkbox${cbChecked} onchange="toggleSelect('${esc(c.id)}',this)"></div><div class=tabs style="flex:1">${tabsHtml}</div></div>`;
-    g.appendChild(el);
+    tabs.forEach(t => _browseItems.push({c, t}));
   });
+  const hotCol = document.createElement('div');
+  hotCol.className = 'col col-hot';
+  hotCol.innerHTML = '<div class="col-header">Active</div>';
+  if (!hot.length) hotCol.insertAdjacentHTML('beforeend', '<div class="col-empty">No active sessions</div>');
+  hot.forEach(c => hotCol.appendChild(_buildRow(c)));
+  const coldCol = document.createElement('div');
+  coldCol.className = 'col col-cold';
+  coldCol.innerHTML = '<div class="col-header">Hibernated</div>';
+  if (!cold.length) coldCol.insertAdjacentHTML('beforeend', '<div class="col-empty">No hibernated sessions</div>');
+  cold.forEach(c => coldCol.appendChild(_buildRow(c)));
+  g.appendChild(hotCol);
+  g.appendChild(coldCol);
   _browseFocusIdx = -1;
   _highlightBrowse();
   updateBulkBar();
@@ -396,40 +470,53 @@ function _activateBrowseItem(i) {
 let _searchMatches = [];   // [{c, t}] — flat list of current matches
 let _searchFocusIdx = -1;
 
+function _buildSearchRow(c, t, gi, focused) {
+  const el = document.createElement('div');
+  el.className = 'search-row' + (focused ? ' focused' : '') + (c.hot ? ' search-hot' : ' search-cold');
+  el.dataset.matchIdx = gi;
+  const label = esc(t.title || trimUrl(t.url));
+  const urlLabel = esc(trimUrl(t.url));
+  el.innerHTML = `<div class=tab-body onclick="_activateSearchMatch(${gi})" style="flex:1;overflow:hidden"><span class=tab-title>${label}</span><span class=tab-url>${urlLabel}</span></div>`;
+  return el;
+}
+
 function renderSearch(q, data) {
   const g = document.getElementById('list');
   g.innerHTML = '';
   _searchMatches = [];
   _browseItems = [];
   const lq = q.toLowerCase();
+  const hotM = [], coldM = [];
   (data.containers||[]).forEach((c, idx) => {
     const tabs = c.hot ? (c.live_tabs||[]) : (c.saved_tabs||[]);
     tabs.forEach(t => {
       if (!(t.title||'').toLowerCase().includes(lq) &&
           !(t.url||'').toLowerCase().includes(lq)) return;
-      _searchMatches.push({c, t, idx});
+      (c.hot ? hotM : coldM).push({c, t, idx});
     });
   });
+  _searchMatches = [...hotM, ...coldM];
   if (!_searchMatches.length) {
-    g.innerHTML = '<div style="color:#475569;padding:8px 10px;font-size:13px">No matching tabs</div>';
+    g.innerHTML = '<div style="color:#475569;padding:8px 10px;font-size:13px;grid-column:1/-1">No matching tabs</div>';
     _searchFocusIdx = -1;
     return;
   }
   _searchFocusIdx = _searchMatches.length === 1 ? 0 : -1;
-  _searchMatches.forEach(({c, t, idx}, i) => {
-    const el = document.createElement('div');
-    el.className = 'search-row' + (i === _searchFocusIdx ? ' focused' : '');
-    el.dataset.matchIdx = i;
-    const label    = esc(t.title || trimUrl(t.url));
-    const urlLabel = esc(trimUrl(t.url));
-    const onclick  = `_activateSearchMatch(${i})`;
-    el.innerHTML = `
-      <div class=tab-body onclick="${onclick}" style="flex:1;overflow:hidden">
-        <span class=tab-title>${label}</span>
-        <span class=tab-url>${urlLabel}</span>
-      </div>`;
-    g.appendChild(el);
+  const hotCol = document.createElement('div');
+  hotCol.className = 'col col-hot';
+  hotCol.innerHTML = '<div class="col-header">Active</div>';
+  const coldCol = document.createElement('div');
+  coldCol.className = 'col col-cold';
+  coldCol.innerHTML = '<div class="col-header">Hibernated</div>';
+  hotM.forEach(({c, t}, i) => hotCol.appendChild(_buildSearchRow(c, t, i, i === _searchFocusIdx)));
+  coldM.forEach(({c, t}, i) => {
+    const gi = hotM.length + i;
+    coldCol.appendChild(_buildSearchRow(c, t, gi, gi === _searchFocusIdx));
   });
+  if (!hotM.length) hotCol.insertAdjacentHTML('beforeend', '<div class="col-empty">No matches</div>');
+  if (!coldM.length) coldCol.insertAdjacentHTML('beforeend', '<div class="col-empty">No matches</div>');
+  g.appendChild(hotCol);
+  g.appendChild(coldCol);
 }
 
 function _activateSearchMatch(i) {
@@ -443,8 +530,9 @@ function _activateSearchMatch(i) {
 function _moveFocus(delta) {
   if (!_searchMatches.length) return;
   _searchFocusIdx = (_searchFocusIdx + delta + _searchMatches.length) % _searchMatches.length;
-  document.querySelectorAll('.search-row').forEach((el, i) =>
-    el.classList.toggle('focused', i === _searchFocusIdx));
+  const rows = document.querySelectorAll('.search-row');
+  rows.forEach((el, i) => el.classList.toggle('focused', i === _searchFocusIdx));
+  if (rows[_searchFocusIdx]) rows[_searchFocusIdx].scrollIntoView({block:'nearest'});
 }
 
 function clearSearch() {
@@ -495,6 +583,36 @@ document.addEventListener('click', e => {
   }
 });
 
+// ── cut / paste (move tab between sessions) ───────────────────────────────
+function cutTab(cid, url, targetId, isHot) {
+  if (_cutTab && _cutTab.cid === cid && _cutTab.url === url) {
+    cancelCut(); return;
+  }
+  _cutTab = {cid, url, targetId: targetId||'', isHot};
+  toast('Tab cut — click paste on another session');
+  _lastJson = ''; if (_lastData) renderList(_lastData);
+  refocusSearch();
+}
+function cancelCut() {
+  _cutTab = null;
+  _lastJson = ''; if (_lastData) renderList(_lastData);
+  refocusSearch();
+}
+async function pasteTab(destCid) {
+  if (!_cutTab) return;
+  const {cid: src, url, targetId} = _cutTab;
+  _cutTab = null;
+  toast('Moving tab…');
+  try {
+    const res = await api('/api/move-tab', 'POST',
+      {src, dest: destCid, url, targetId});
+    if (res.error) { toast('Move failed: ' + res.error); }
+    else { toast('Tab moved'); }
+  } catch(e) { toast('Move failed'); }
+  _lastJson = ''; refresh();
+  refocusSearch();
+}
+
 // ── row-level actions (hover buttons) ─────────────────────────────────────
 async function rowAction(action, cid) {
   if (action === 'delete' && !confirm('Delete this session?')) return;
@@ -517,7 +635,7 @@ async function trimLog() {
   toast('Trimming log…');
   try {
     const r = await api('/api/trim-log', 'POST');
-    if (r.trimmed) toast(`Log trimmed — kept ${(r.kept_bytes/1024).toFixed(1)} KB`);
+    if (r.trimmed) toast(`Log trimmed — kept last 500 lines`);
     else toast('Trim skipped: ' + (r.reason || 'unknown'));
   } catch(e) { toast('Trim failed'); }
 }
