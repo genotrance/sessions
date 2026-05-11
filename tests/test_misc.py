@@ -71,7 +71,6 @@ class TestTrimLog(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _make_mgr(self):
-        store = PersistenceManager(os.path.join(self.tmp, "db.sqlite"))
         mgr = ContainerManager.__new__(ContainerManager)
         mgr._log_path = self.log_path
         return mgr

@@ -1491,11 +1491,11 @@ class ContainerManager:
             with open(path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             if len(lines) <= keep:
-                return {"trimmed": False, "reason": "log has only %d lines" % len(lines)}
+                return {"trimmed": False, "reason": f"log has only {len(lines)} lines"}
             kept = lines[-keep:]
             with open(path, "w", encoding="utf-8") as f:
                 f.writelines(kept)
-            kept_bytes = sum(len(l) for l in kept)
+            kept_bytes = sum(len(ln) for ln in kept)
             log.debug("trim_log: kept last %d lines (%d bytes)", keep, kept_bytes)
             return {"trimmed": True, "kept_bytes": kept_bytes}
         except Exception as e:
