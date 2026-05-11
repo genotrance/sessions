@@ -27,6 +27,18 @@ def clean_cookie(c: dict) -> dict:
         scheme = "https" if out.get("secure") else "http"
         path = out.get("path", "/")
         out["url"] = f"{scheme}://{domain}{path}"
+    # __Host- cookies must be host-only (no Domain attribute).  CDP returns
+    # them with a domain field, but setCookies will create a domain cookie
+    # if both url and domain are present, which Chrome then rejects because
+    # __Host- prefix requires host-only.  Remove domain, keep url.
+    name = out.get("name", "")
+    if name.startswith("__Host-") and "url" in out:
+        out.pop("domain", None)
+    # Session cookies: CDP returns expires <= 0, but setCookies interprets
+    # that as a Unix timestamp (1969/1970), making the cookie immediately
+    # expired.  Remove expires so setCookies creates a session cookie.
+    if out.get("expires") is not None and out["expires"] <= 0:
+        del out["expires"]
     return out
 
 

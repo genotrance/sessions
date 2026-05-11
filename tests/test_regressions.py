@@ -114,6 +114,75 @@ class TestCookieUrlSynthesis(unittest.TestCase):
         self.assertIn("discord.com", c["url"])
         self.assertNotIn(".discord.com", c["url"])
 
+    def test_host_cookie_removes_domain(self):
+        """__Host- cookies must not have a domain attribute (host-only)."""
+        c = clean_cookie({
+            "name": "__Host-GAPS", "value": "secret",
+            "domain": "accounts.google.com", "path": "/",
+            "secure": True, "httpOnly": True,
+        })
+        self.assertNotIn("domain", c)
+        self.assertEqual(c["url"], "https://accounts.google.com/")
+
+    def test_host_cookie_without_url_synthesizes_url(self):
+        """__Host- cookie with only domain gets url synthesized, domain removed."""
+        c = clean_cookie({
+            "name": "__Host-GMAIL_SCH", "value": "nsl",
+            "domain": "mail.google.com", "path": "/",
+            "secure": True,
+        })
+        self.assertNotIn("domain", c)
+        self.assertIn("url", c)
+        self.assertEqual(c["url"], "https://mail.google.com/")
+
+    def test_host_cookie_preserves_existing_url(self):
+        """__Host- cookie with explicit url keeps it, domain removed."""
+        c = clean_cookie({
+            "name": "__Host-X", "value": "v",
+            "url": "https://example.com/",
+            "domain": "example.com", "path": "/",
+            "secure": True,
+        })
+        self.assertNotIn("domain", c)
+        self.assertEqual(c["url"], "https://example.com/")
+
+    def test_session_cookie_removes_negative_expires(self):
+        """Session cookies (expires=-1 from CDP) must omit expires."""
+        c = clean_cookie({
+            "name": "SID", "value": "abc",
+            "domain": ".google.com", "path": "/",
+            "expires": -1, "secure": False,
+        })
+        self.assertNotIn("expires", c)
+
+    def test_session_cookie_removes_zero_expires(self):
+        """Session cookies (expires=0) must omit expires."""
+        c = clean_cookie({
+            "name": "sess", "value": "x",
+            "domain": "example.com", "path": "/",
+            "expires": 0,
+        })
+        self.assertNotIn("expires", c)
+
+    def test_normal_cookie_keeps_expires(self):
+        """Non-session cookies keep their expires timestamp."""
+        c = clean_cookie({
+            "name": "NID", "value": "abc",
+            "domain": ".google.com", "path": "/",
+            "expires": 1811907081.0, "secure": True,
+        })
+        self.assertEqual(c["expires"], 1811907081.0)
+
+    def test_secure_cookie_keeps_domain(self):
+        """__Secure- cookies (not __Host-) should keep domain."""
+        c = clean_cookie({
+            "name": "__Secure-1PSID", "value": "abc",
+            "domain": ".google.com", "path": "/",
+            "secure": True, "httpOnly": True,
+        })
+        self.assertIn("domain", c)
+        self.assertEqual(c["domain"], ".google.com")
+
 
 # ---------------------------------------------------------------------------
 # BUG: Dashboard not showing hot/cold state — no visual indicator

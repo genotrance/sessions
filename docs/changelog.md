@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - **Cold→hot source tab not removed**: Source tab removal now uses `save_hibernation` (full rewrite) instead of `delete_tab` which could silently fail.
 - **Move tab doesn't steal focus**: Moved tabs open in the background (`background: true`) so the dashboard stays in the foreground.
 - **Hibernate/delete only on first-tab hover**: Session-level action icons now only appear when hovering the first tab row, not any tab in the session.
+- **Gmail/Google re-login after restart**: `__Host-` prefixed cookies (critical for Google authentication) were silently rejected during restore because they were set with a `domain` attribute. Chrome requires `__Host-` cookies to be host-only. Session cookies (no expiry) were also lost because CDP's `expires: -1` was passed through to `setCookies`, which interpreted it as a 1969 timestamp.
 - **Empty session row overflow**: Hibernate/delete buttons no longer extend beyond the session box.
 - **Trim log keeps last 500 lines**: The "Trim Log" button now keeps the last 500 lines instead of clearing the file.
 - **Dashboard width**: Dashboard UI now uses 90% of screen width for the two-column layout.
