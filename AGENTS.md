@@ -23,6 +23,12 @@
 - Do not add CI, build system, tooling, test infrastructure, or other internal changes to the changelog.
 - Keep entries concise and focused on what changed for users of the application.
 
+## Versioning
+
+- The version is defined in three places that must stay in sync: `pyproject.toml` (`version`), `src/sessions/__init__.py` (`__version__`), and `docs/changelog.md` (section header).
+- When bumping the version, update all three locations in the same commit.
+- After pushing a version bump, create an annotated git tag (e.g. `git tag -a v0.1.2 -m "v0.1.2"`) and push it (`git push origin --tags`).
+
 ## Scope discipline
 
 - Do not remove any capability or support unless explicitly asked by the user.
