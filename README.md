@@ -55,6 +55,7 @@ pip install -e .
 
 - **Hibernate** (pause icon) — Saves the session's tabs, cookies, and site data, then closes its browser window to free memory.
 - **Restore** (play icon) — Brings a hibernated session back with all its tabs and logins intact.
+- **Move tab** (scissors icon) — Cut a tab from one session and paste it into another. Hover over a tab to see the scissors icon; click it, then click the paste icon on any other session. Works between active and hibernated sessions — cookies, localStorage, and IndexedDB for that tab's origin are transferred. Press Escape to cancel.
 - **Delete** (trash icon) — Permanently removes a session and all its saved data.
 - **Clean** — Wipes cookies, localStorage, and IndexedDB for a session. For running sessions, data is cleared in the live browser so it behaves like a fresh session without needing to restart.
 - **Restart** — Restarts the Sessions backend while keeping Chrome running.
@@ -64,9 +65,13 @@ pip install -e .
 
 Use the checkboxes next to each session (or the select-all checkbox) to select multiple sessions, then use the bulk action bar to **Restore**, **Hibernate**, **Clean**, or **Delete** them all at once.
 
+### Dashboard layout
+
+The dashboard splits into two columns — **Active** sessions on the left and **Hibernated** on the right. Each session has a green (active) or yellow (hibernated) left border for quick identification.
+
 ### Search and keyboard navigation
 
-Use the search box to filter sessions by name, URL, or tab title. Arrow keys navigate the list, Enter activates the focused item, and Escape clears the search.
+Use the search box to filter sessions by name, URL, or tab title. Search results are also split into Active/Hibernated columns. Arrow keys navigate hot results first then cold, Enter activates the focused item, and Escape clears the search.
 
 ### Right-click menu
 
@@ -78,9 +83,11 @@ Right-click any session for a context menu with **Restore**, **Hibernate**, **Cl
 - **Full state persistence** — Sessions are saved to a local SQLite database including cookies, storage, and open tabs.
 - **Auto-save** — Running sessions are periodically snapshotted so nothing is lost if Chrome crashes.
 - **Auto-hibernate** — Closing a browser window automatically hibernates the session.
+- **Move tabs between sessions** — Cut a tab from any session and paste it into another, transferring cookies, localStorage, and IndexedDB for that origin.
 - **Tab restoration** — Hibernated sessions restore all tabs with their original URLs and site data.
 - **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Bulk operations in progress (e.g. hibernate) are honoured — sessions you asked to hibernate stay hibernated.
 - **Cross-platform** — Works on Windows, macOS, and Linux with Chrome or Edge.
+- **Two-column dashboard** — Active sessions on the left, hibernated on the right, each with a colored left border.
 - **Dashboard UI** — A lightweight web dashboard for managing sessions from any tab.
 - **Keyboard hotkey** — Press `Win+/` (Windows) or `Ctrl+/` (macOS/Linux) to open the dashboard instantly. Disable with `--no-hotkey` if it conflicts with other software.
 
