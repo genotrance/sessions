@@ -1102,18 +1102,21 @@ class ContainerManager:
 
     def _open_tab_with_storage(self, ctx: str, url: str,
                                storage_by_origin: dict,
-                               idb_by_origin: dict | None = None) -> str:
+                               idb_by_origin: dict | None = None,
+                               background: bool = False) -> str:
         origin = _origin_of(url) if url else None
         ls_data = storage_by_origin.get(origin) if origin else None
         idb_data = (idb_by_origin or {}).get(origin) if origin else None
         needs_inject = bool(ls_data or idb_data)
         open_url = "about:blank" if needs_inject else (url or "about:blank")
+        kw: dict = {"background": True} if background else {}
         with self._browser_session() as bs:
             tid = bs.target.create_target(
-                url=open_url, browser_context_id=ctx)
+                url=open_url, browser_context_id=ctx, **kw)
         if not tid:
             return ""
-        self._maximize_tab(tid)
+        if not background:
+            self._maximize_tab(tid)
         if not needs_inject:
             return tid
         ws_url = None
@@ -1479,26 +1482,22 @@ class ContainerManager:
                 "debug_mode": getattr(self, "_debug_mode", False)}
 
     def trim_log(self) -> dict:
-        """Trim the debug log, keeping only from the most recent PROCESS START separator."""
+        """Trim the debug log, keeping only the last 500 lines."""
         path = getattr(self, "_log_path", None)
         if not path:
             return {"trimmed": False, "reason": "debug mode not active"}
+        keep = 500
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            marker = "  PROCESS START  "
-            idx = content.rfind(marker)
-            if idx == -1:
-                return {"trimmed": False, "reason": "no startup marker found"}
-            # Walk back to the start of the separator line (the dashes line before it)
-            sep_start = content.rfind("\n", 0, idx)
-            sep_start = content.rfind("\n", 0, sep_start) if sep_start > 0 else 0
-            kept = content[sep_start:].lstrip("\n")
+                lines = f.readlines()
+            if len(lines) <= keep:
+                return {"trimmed": False, "reason": "log has only %d lines" % len(lines)}
+            kept = lines[-keep:]
             with open(path, "w", encoding="utf-8") as f:
-                f.write(kept)
-            log.debug("trim_log: trimmed %d bytes, kept %d bytes",
-                      len(content) - len(kept), len(kept))
-            return {"trimmed": True, "kept_bytes": len(kept)}
+                f.writelines(kept)
+            kept_bytes = sum(len(l) for l in kept)
+            log.debug("trim_log: kept last %d lines (%d bytes)", keep, kept_bytes)
+            return {"trimmed": True, "kept_bytes": kept_bytes}
         except Exception as e:
             log.warning("trim_log failed: %s", e)
             return {"trimmed": False, "reason": str(e)}
@@ -1536,6 +1535,182 @@ class ContainerManager:
         with self._browser_session() as bs:
             bs.target.close_target(target_id)
         return {"targetId": target_id, "closed": True}
+
+    def move_tab(self, src_cid: str, dest_cid: str,
+                 url: str = "", target_id: str = "") -> dict:
+        """Move a tab from one session to another.
+
+        Works for any combination of hot/cold source and destination.
+        For hot sources the live tab is snapshot-closed; for hot destinations
+        the tab is opened in the browser context with storage injection.
+        """
+        log.debug("move_tab src=%s dest=%s url=%s tid=%s",
+                  src_cid, dest_cid, url, target_id)
+        if src_cid == dest_cid:
+            return {"error": "source and destination are the same"}
+        return self._move_tab_locked(src_cid, dest_cid, url, target_id)
+
+    def _move_tab_locked(self, src_cid: str, dest_cid: str,
+                         url: str, target_id: str) -> dict:
+        with self._lock:
+            src_hot = src_cid in self.hot
+            dest_hot = dest_cid in self.hot
+
+            # -- Resolve URL from targetId for hot sources -------------------
+            if src_hot and target_id and not url:
+                with self._browser_session() as bs:
+                    for t in bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT):
+                        if t.get("targetId") == target_id:
+                            url = t.get("url", "")
+                            break
+            if not url:
+                return {"error": "no url specified"}
+
+            tab_title = ""
+            tab_storage: dict = {}
+            tab_idb: dict = {}
+            tab_cookies: list[dict] = []
+            origin = _origin_of(url) if url else None
+
+            # -- Collect state from source (read-only) -------------------------
+            hot_tid = None
+            if src_hot:
+                ctx = self.hot[src_cid]
+                tid = target_id
+                if not tid:
+                    with self._browser_session() as bs:
+                        for t in bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT):
+                            if (t.get("browserContextId") == ctx
+                                    and t.get("url") == url
+                                    and t.get("type") == "page"):
+                                tid = t["targetId"]
+                                break
+                if tid:
+                    hot_tid = tid
+                    try:
+                        with self._tab_session(tid) as ts:
+                            tab_origin = ts.runtime.evaluate(
+                                "window.location.origin",
+                                timeout=SNAPSHOT_CDP_TIMEOUT)
+                            if tab_origin and tab_origin != "null":
+                                origin = tab_origin
+                                try:
+                                    dom_st = ts.send("DOMStorage.getDOMStorageItems", {
+                                        "storageId": {
+                                            "securityOrigin": origin,
+                                            "isLocalStorage": True,
+                                        }
+                                    }, timeout=SNAPSHOT_CDP_TIMEOUT)
+                                    for k, v in dom_st.get("entries", []):
+                                        tab_storage[k] = v
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        log.debug("move_tab: storage collect error: %s", e)
+                    for t in self._get_targets_cached():
+                        if t.get("targetId") == tid or t.get("id") == tid:
+                            tab_title = t.get("title", "")
+                            break
+                    try:
+                        with self._browser_session() as bs:
+                            all_cookies = bs.storage.get_cookies(
+                                browser_context_id=ctx,
+                                timeout=SNAPSHOT_CDP_TIMEOUT)
+                        if origin:
+                            tab_cookies = [c for c in all_cookies
+                                           if origin.endswith(
+                                               c.get("domain", "").lstrip("."))]
+                    except Exception:
+                        pass
+            else:
+                src = self.store.get_container(src_cid)
+                if not src:
+                    return {"error": "source container not found"}
+                tab_match = next((t for t in src["tabs"] if t["url"] == url), None)
+                if not tab_match:
+                    return {"error": "tab not found in source"}
+                tab_title = tab_match.get("title", "")
+                if origin:
+                    tab_storage = src.get("storage", {}).get(origin, {})
+                    tab_idb = src.get("idb", {}).get(origin, {})
+                    tab_cookies = [c for c in src.get("cookies", [])
+                                   if origin.endswith(
+                                       c.get("domain", "").lstrip("."))]
+
+            # -- Close hot source tab NOW (lock prevents watcher race) ---------
+            if src_hot and hot_tid:
+                try:
+                    with self._browser_session() as bs:
+                        bs.target.close_target(hot_tid)
+                except Exception:
+                    pass
+
+            # -- Insert into destination ---------------------------------------
+            if dest_hot:
+                dest_ctx = self.hot[dest_cid]
+                storage_by_origin = {origin: tab_storage} if origin and tab_storage else {}
+                idb_by_origin = {origin: tab_idb} if origin and tab_idb else {}
+                if tab_cookies:
+                    try:
+                        clean = [c for c in (_clean_cookie(c) for c in tab_cookies) if c]
+                        if clean:
+                            with self._browser_session() as bs:
+                                bs.storage.set_cookies(clean,
+                                                       browser_context_id=dest_ctx)
+                    except Exception as e:
+                        log.debug("move_tab: cookie inject error: %s", e)
+                new_tid = self._open_tab_with_storage(
+                    dest_ctx, url, storage_by_origin, idb_by_origin,
+                    background=True)
+                log.debug("move_tab: opened %s in dest ctx %s", new_tid, dest_ctx)
+            else:
+                if not src_hot:
+                    # cold→cold: atomic DB move (insert + delete in one txn)
+                    self.store.move_tab(src_cid, dest_cid, url)
+                else:
+                    # hot→cold: write collected state into dest DB
+                    dest = self.store.get_container(dest_cid)
+                    if dest is not None:
+                        cookies = dest.get("cookies", [])
+                        storage = dest.get("storage", {})
+                        idb = dest.get("idb", {})
+                        if origin and tab_storage:
+                            storage[origin] = tab_storage
+                        if origin and tab_idb:
+                            idb[origin] = tab_idb
+                        if tab_cookies:
+                            existing = {(c.get("name"), c.get("domain"), c.get("path"))
+                                        for c in cookies}
+                            for ck in tab_cookies:
+                                key = (ck.get("name"), ck.get("domain"), ck.get("path"))
+                                if key not in existing:
+                                    cookies.append(ck)
+                        tabs = dest.get("tabs", [])
+                        tabs.append({"url": url, "title": tab_title})
+                        self.store.save_hibernation(
+                            dest_cid, cookies, storage, tabs,
+                            keep_active=False, idb=idb)
+                new_tid = ""
+
+            # -- Remove cold source AFTER successful insert --------------------
+            if not src_hot:
+                src_data = self.store.get_container(src_cid)
+                if src_data:
+                    remaining = []
+                    removed = False
+                    for t in src_data.get("tabs", []):
+                        if t["url"] == url and not removed:
+                            removed = True
+                            continue
+                        remaining.append(t)
+                    if removed:
+                        self.store.save_hibernation(
+                            src_cid, src_data["cookies"], src_data["storage"],
+                            remaining, idb=src_data.get("idb"))
+
+            log.debug("move_tab: done src=%s dest=%s url=%s", src_cid, dest_cid, url)
+            return {"moved": True, "url": url, "src": src_cid, "dest": dest_cid,
+                    "targetId": new_tid if dest_hot else ""}
 
     def close_chrome(self) -> None:
         log.debug("close_chrome called")

@@ -7,11 +7,18 @@ Run with:  python -m pytest tests/test_focus_live.py -v -m live
 from __future__ import annotations
 
 import json
+import sys
 import time
+import unittest
 
-import pytest
-import requests
-import websocket
+try:
+    import pytest
+    import requests
+    import websocket
+except ImportError:
+    if "unittest" in sys.modules:
+        raise unittest.SkipTest("pytest/requests/websocket not installed")
+    raise
 
 CHROME_PORT = 9222
 

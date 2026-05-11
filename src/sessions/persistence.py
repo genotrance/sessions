@@ -224,6 +224,77 @@ class PersistenceManager:
                 return True
             return False
 
+    def move_tab(self, src_cid: str, dest_cid: str, url: str) -> bool:
+        """Move a single tab (by URL) from *src_cid* to *dest_cid*.
+
+        Copies the tab row and any origin-specific cookies, localStorage, and
+        IndexedDB blobs associated with the tab's origin.  Returns True if the
+        tab was found and moved."""
+        from .utils import origin_of as _origin_of
+        with self._lock, self._conn() as c:
+            # 1. Find the tab row in source (read-only first)
+            rowid = c.execute(
+                "SELECT rowid FROM container_tabs "
+                "WHERE container_id=? AND url=? LIMIT 1",
+                (src_cid, url)).fetchone()
+            if not rowid:
+                return False
+            tab = c.execute(
+                "SELECT url, title, last_scrolled FROM container_tabs "
+                "WHERE rowid=?", (rowid[0],)).fetchone()
+
+            # 2. Insert into destination FIRST
+            c.execute(
+                "INSERT INTO container_tabs"
+                "(container_id, url, title, last_scrolled) VALUES (?,?,?,?)",
+                (dest_cid, tab["url"], tab["title"], tab["last_scrolled"]))
+
+            # 3. Delete from source AFTER successful insert
+            c.execute("DELETE FROM container_tabs WHERE rowid=?", (rowid[0],))
+
+            # 4. Copy origin-specific storage/cookies/idb
+            origin = _origin_of(url) if url else None
+            if origin:
+                src_row = c.execute(
+                    "SELECT cookies_blob, storage_blob, idb_blob "
+                    "FROM containers WHERE id=?", (src_cid,)).fetchone()
+                dest_row = c.execute(
+                    "SELECT cookies_blob, storage_blob, idb_blob "
+                    "FROM containers WHERE id=?", (dest_cid,)).fetchone()
+                if src_row and dest_row:
+                    # Cookies: copy cookies whose domain matches the origin
+                    src_cookies = json.loads(src_row["cookies_blob"] or "[]")
+                    dest_cookies = json.loads(dest_row["cookies_blob"] or "[]")
+                    moved_cookies = [ck for ck in src_cookies
+                                     if origin.endswith(ck.get("domain", "").lstrip("."))]
+                    if moved_cookies:
+                        # Avoid duplicates in destination
+                        existing = {(ck.get("name"), ck.get("domain"), ck.get("path"))
+                                    for ck in dest_cookies}
+                        for ck in moved_cookies:
+                            key = (ck.get("name"), ck.get("domain"), ck.get("path"))
+                            if key not in existing:
+                                dest_cookies.append(ck)
+                        c.execute("UPDATE containers SET cookies_blob=? WHERE id=?",
+                                  (json.dumps(dest_cookies), dest_cid))
+
+                    # localStorage
+                    src_storage = json.loads(src_row["storage_blob"] or "{}")
+                    dest_storage = json.loads(dest_row["storage_blob"] or "{}")
+                    if origin in src_storage:
+                        dest_storage[origin] = src_storage[origin]
+                        c.execute("UPDATE containers SET storage_blob=? WHERE id=?",
+                                  (json.dumps(dest_storage), dest_cid))
+
+                    # IndexedDB
+                    src_idb = _decompress_blob(src_row["idb_blob"] or "{}")
+                    dest_idb = _decompress_blob(dest_row["idb_blob"] or "{}")
+                    if origin in src_idb:
+                        dest_idb[origin] = src_idb[origin]
+                        c.execute("UPDATE containers SET idb_blob=? WHERE id=?",
+                                  (_compress_blob(dest_idb), dest_cid))
+        return True
+
     def delete_container(self, cid: str) -> None:
         with self._lock, self._conn() as c:
             c.execute("DELETE FROM container_tabs WHERE container_id=?", (cid,))

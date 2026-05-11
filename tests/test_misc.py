@@ -56,6 +56,71 @@ class TestDebugLogging(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Trim log test
+# ---------------------------------------------------------------------------
+
+class TestTrimLog(unittest.TestCase):
+    """Verify trim_log keeps the last 500 lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ctxd-trim-")
+        self.log_path = os.path.join(self.tmp, "debug.log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_mgr(self):
+        store = PersistenceManager(os.path.join(self.tmp, "db.sqlite"))
+        mgr = ContainerManager.__new__(ContainerManager)
+        mgr._log_path = self.log_path
+        return mgr
+
+    def test_trim_large_log(self):
+        """Log with >500 lines keeps only the last 500."""
+        with open(self.log_path, "w") as f:
+            for i in range(800):
+                f.write(f"line {i}\n")
+        mgr = self._make_mgr()
+        res = mgr.trim_log()
+        self.assertTrue(res["trimmed"])
+        with open(self.log_path) as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 500)
+        self.assertEqual(lines[0].strip(), "line 300")
+        self.assertEqual(lines[-1].strip(), "line 799")
+
+    def test_no_trim_small_log(self):
+        """Log with <=500 lines is not trimmed."""
+        with open(self.log_path, "w") as f:
+            for i in range(200):
+                f.write(f"line {i}\n")
+        mgr = self._make_mgr()
+        res = mgr.trim_log()
+        self.assertFalse(res["trimmed"])
+        with open(self.log_path) as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 200)
+
+    def test_no_log_path(self):
+        """If debug mode is off, trim_log returns reason."""
+        mgr = ContainerManager.__new__(ContainerManager)
+        mgr._log_path = None
+        res = mgr.trim_log()
+        self.assertFalse(res["trimmed"])
+        self.assertIn("not active", res["reason"])
+
+    def test_trim_exactly_500(self):
+        """Log with exactly 500 lines is not trimmed."""
+        with open(self.log_path, "w") as f:
+            for i in range(500):
+                f.write(f"line {i}\n")
+        mgr = self._make_mgr()
+        res = mgr.trim_log()
+        self.assertFalse(res["trimmed"])
+
+
+# ---------------------------------------------------------------------------
 # Optional real-browser integration test
 # ---------------------------------------------------------------------------
 

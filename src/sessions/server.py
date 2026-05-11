@@ -93,6 +93,11 @@ class _ApiHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/bulk-delete":
             ids = self._body().get("ids", [])
             return self._send_json({"results": self.manager.bulk_delete(ids)})
+        if method == "POST" and path == "/api/move-tab":
+            b = self._body()
+            return self._send_json(self.manager.move_tab(
+                b.get("src", ""), b.get("dest", ""),
+                url=b.get("url", ""), target_id=b.get("targetId", "")))
         if method == "POST" and path == "/api/snapshot-all":
             return self._send_json({"results": self.manager.snapshot_all()})
         if method == "POST" and path == "/api/shutdown":
