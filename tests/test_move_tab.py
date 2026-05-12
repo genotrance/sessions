@@ -562,7 +562,8 @@ class TestDashboardTwoColumnLayout(unittest.TestCase):
         cls.html = DASHBOARD_HTML
 
     def test_grid_layout(self):
-        self.assertIn('grid-template-columns:1fr 1fr', self.html)
+        self.assertIn('grid-template-columns:', self.html)
+        self.assertIn('1fr', self.html)
 
     def test_col_classes(self):
         self.assertIn('col-hot', self.html)

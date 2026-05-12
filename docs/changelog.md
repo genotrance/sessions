@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-05-12
+
+### Fixed
+
+- **Dashboard column width responsiveness**: Two-column layout now dynamically adjusts to match the width of the search bar and top header at all window sizes using `minmax(0, 1fr)` grid columns.
+
 ## [0.1.2] - 2026-05-11
 
 ### Added

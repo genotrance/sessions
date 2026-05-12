@@ -41,7 +41,7 @@ DASHBOARD_HTML = r"""<!doctype html>
                   font-size:16px; cursor:pointer; padding:0 4px; line-height:1; }
   #search-clear:hover { color:#e2e8f0; }
   /* session list */
-  .list { display:grid; grid-template-columns:1fr 1fr; gap:0 16px;
+  .list { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0 16px;
          padding:8px 16px 16px; align-items:start; }
   .col { display:flex; flex-direction:column; gap:6px; }
   .col-header { font-size:11px; color:#64748b; text-transform:uppercase;
