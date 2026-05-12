@@ -8,8 +8,9 @@ DASHBOARD_HTML = r"""<!doctype html>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, system-ui, Segoe UI, sans-serif;
-         margin: 0 auto; padding: 0; background: #0f172a; color: #e2e8f0;
-         font-size: 14px; max-width: 90%; }
+         margin: 0; padding: 0; background: #0f172a; color: #e2e8f0;
+         font-size: 14px; }
+  .wrap { max-width: 90%; margin: 0 auto; }
   .sticky-header { position:sticky; top:0; z-index:100; background:#0f172a;
                    padding:16px 16px 0; }
   h1 { margin: 0 0 12px; font-size: 19px; display:flex; align-items:center;
@@ -147,6 +148,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
+<div class=wrap>
 <div class=sticky-header>
 <h1>Sessions <span class=toolbar>
   <button class=primary onclick=createSession()>+ New</button>
@@ -174,6 +176,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div id=disconnected>Disconnected — waiting for backend...</div>
 </div>
 <div id=list class=list></div>
+</div>
 <div id=toast></div>
 <!-- right-click context menu -->
 <div id=ctx-menu>
