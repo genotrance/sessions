@@ -48,7 +48,8 @@ DASHBOARD_HTML = r"""<!doctype html>
                 letter-spacing:0.05em; padding:2px 4px 4px; font-weight:600; }
   .col-empty { color:#334155; font-size:12px; font-style:italic; padding:4px 10px; }
   .row { background:#1e293b; border:1px solid #334155; border-radius:6px;
-         border-left:3px solid #334155; transition:border-color 0.2s; }
+         border-left:3px solid #334155; transition:border-color 0.2s;
+         overflow:hidden; }
   .row.hot  { border-left-color:#22c55e; }
   .row.cold { border-left-color:#f59e0b; }
   .row.selected { outline:2px solid #3b82f6; outline-offset:-2px; }
@@ -86,7 +87,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tab-title { flex:0 0 auto; overflow:hidden;
                text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
   .tab-url { color:#64748b; overflow:hidden; text-overflow:ellipsis;
-             white-space:nowrap; flex:1 1 auto; font-size:12px; min-width:0; max-width:300px; }
+             white-space:nowrap; flex:1 1 auto; font-size:12px; min-width:0; }
   .tab-close { flex:0 0 auto; opacity:0; cursor:pointer; font-size:15px;
                padding:0 2px; }
   .tab:hover .tab-close { opacity:0.4; }
@@ -408,7 +409,7 @@ function _buildRow(c) {
     tabsHtml = `<div class=row-empty><span style="color:#475569">${c.hot?'no tabs':'hibernated'}</span>${pasteHtml}${rowActionsHtml(c)}</div>`;
   }
   const cbChecked = selected.has(c.id) ? ' checked' : '';
-  el.innerHTML = `<div style="display:flex"><div class=row-cb><input type=checkbox${cbChecked} onchange="toggleSelect('${esc(c.id)}',this)"></div><div class=tabs style="flex:1">${tabsHtml}</div></div>`;
+  el.innerHTML = `<div style="display:flex"><div class=row-cb><input type=checkbox${cbChecked} onchange="toggleSelect('${esc(c.id)}',this)"></div><div class=tabs style="flex:1;min-width:0">${tabsHtml}</div></div>`;
   if (isPasteTarget) el.addEventListener('click', e => {
     if (!e.target.closest('.tab') && !e.target.closest('input')) pasteTab(c.id);
   });

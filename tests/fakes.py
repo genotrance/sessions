@@ -323,7 +323,7 @@ class _PatchedManagerMixin:
         self.mgr._get_targets_cached = lambda max_age=2.0, _fb=self.fb: [
             dict(t, id=t["targetId"]) for t in _fb.targets.values()
         ]
-        self.mgr._chrome_http_reachable = lambda: False
+        self.mgr._chrome_http_reachable = lambda **_kw: False
 
     def tearDown(self):
         import shutil

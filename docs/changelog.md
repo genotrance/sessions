@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-05-21
+
+### Fixed
+
+- **Sleep/wake duplicate windows**: After resuming from sleep, Chrome windows were duplicated because the crash recovery mechanism mistook a sluggish-but-alive Chrome for a dead process. Fixed by: (1) detecting sleep/wake via wall-clock gaps in the watcher loop and suppressing crash recovery for 15s afterward, (2) increasing the crash detection threshold from 2 to 5 consecutive failures, (3) making HTTP reachability checks retry 3× with longer timeouts (1s+5s instead of 0.5s+2s), (4) adding a 6-second grace period in `recover_chrome` to verify Chrome is truly dead before force-killing it, and (5) using `reconnect_to_existing` after restart to deduplicate windows restored by Chrome's own session restore.
+- **Debug log location**: Debug log now writes to `sessions_debug.log` in the system temp directory (cross-platform) instead of the code directory, preventing permission issues and clutter.
+
 ## [0.1.3] - 2026-05-12
 
 ### Fixed

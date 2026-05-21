@@ -381,13 +381,35 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
 
         self.mgr._on_chrome_crash = _recover
 
-        first = self.mgr.snapshot(c["id"])
-        second = self.mgr.snapshot(c["id"])
+        # Threshold is 5 — first 4 failures just increment, 5th triggers
+        results = []
+        for _ in range(self.mgr._SNAPSHOT_CRASH_FAILURE_THRESHOLD):
+            results.append(self.mgr.snapshot(c["id"]))
 
-        self.assertIn("error", first)
-        self.assertIn("error", second)
+        for r in results:
+            self.assertIn("error", r)
         self.assertTrue(recovered.wait(1.0))
         self.assertEqual(len(calls), 1)
+
+    def test_snapshot_crash_suppressed_during_sleep_cooldown(self):
+        """During the post-sleep cooldown window, snapshot crash recovery
+        must NOT be triggered even if the failure threshold is reached."""
+        c = self.store.create_container("sleep-suppress")
+        self.mgr.restore(c["id"])
+        self.mgr._collect_state = mock.MagicMock(
+            side_effect=RuntimeError("read timed out")
+        )
+        self.mgr._chrome_http_reachable = mock.MagicMock(return_value=False)
+        # Simulate active sleep cooldown
+        self.mgr._sleep_cooldown_until = time.monotonic() + 60
+        calls: list[str] = []
+        self.mgr._on_chrome_crash = lambda: calls.append("called")
+
+        for _ in range(self.mgr._SNAPSHOT_CRASH_FAILURE_THRESHOLD + 2):
+            self.mgr.snapshot(c["id"])
+
+        self.assertEqual(len(calls), 0,
+                         "crash recovery should be suppressed during cooldown")
 
     def test_quick_shutdown(self):
         c = self.store.create_container("qs")
@@ -487,6 +509,79 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
         self.assertEqual(len(full["tabs"]), 1)
         self.assertEqual(full["tabs"][0]["url"], "https://auto.com/page")
         self.assertEqual(len(full["cookies"]), 1)
+
+    def test_watcher_sleep_wake_resets_counters(self):
+        """A large time gap between watcher ticks should reset all failure
+        counters, set a cooldown, and skip the tick entirely."""
+        c = self.store.create_container("sleep-watcher")
+        self.mgr.restore(c["id"])
+        # Pre-set some failure counters
+        self.mgr._snapshot_cdp_failures = 3
+        self.mgr._dashboard_cdp_failures = 2
+        # Simulate the watcher loop with a large time gap by patching
+        # time.monotonic at the module level that manager.py imports.
+        base = time.monotonic()
+        mono_values = iter([base, base + 120])  # 120s gap = sleep/wake
+        self.mgr._watcher_stop.clear()
+        orig_wait = self.mgr._watcher_stop.wait
+        tick_count = [0]
+        def wait_once(timeout):
+            tick_count[0] += 1
+            if tick_count[0] > 1:
+                self.mgr._watcher_stop.set()
+                return True
+            return False
+        self.mgr._watcher_stop.wait = wait_once
+        with mock.patch("sessions.manager.time") as mock_time:
+            mock_time.monotonic = lambda: next(mono_values, base + 200)
+            mock_time.sleep = time.sleep
+            self.mgr._watcher_loop()
+        self.mgr._watcher_stop.wait = orig_wait
+        # Sleep detection should have reset failure counters
+        self.assertEqual(self.mgr._snapshot_cdp_failures, 0)
+
+    def test_dashboard_crash_suppressed_during_cooldown(self):
+        """_check_dashboard_alive should not trigger crash recovery while
+        in the sleep cooldown window."""
+        self.mgr._dashboard_target_id = "fake-tid"
+        self.mgr._on_ui_close = lambda: None
+        self.mgr._on_chrome_crash = lambda: None
+        # Force CDP to fail
+        self.mgr._browser_session = mock.MagicMock(
+            side_effect=RuntimeError("read timed out"))
+        # Set cooldown active
+        self.mgr._sleep_cooldown_until = time.monotonic() + 60
+        # Call multiple times — should never trigger crash recovery
+        crash_calls = []
+        self.mgr._on_chrome_crash = lambda: crash_calls.append(1)
+        for _ in range(10):
+            self.mgr._dashboard_cdp_failures = 0
+            try:
+                self.mgr._check_dashboard_alive()
+            except Exception:
+                pass
+        self.assertEqual(len(crash_calls), 0)
+
+    def test_chrome_http_reachable_retries(self):
+        """_chrome_http_reachable should retry and succeed if Chrome responds
+        on a later attempt."""
+        import sessions.cdp as cdp_mod
+        from sessions.manager import ContainerManager
+        # Restore real method (setUp replaces it with a lambda)
+        real_method = ContainerManager._chrome_http_reachable
+        call_count = [0]
+        ok_response = mock.MagicMock()
+        ok_response.status_code = 200
+        def flaky_get(url, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise ConnectionError("refused")
+            return ok_response
+        with mock.patch.object(cdp_mod.requests, "get", side_effect=flaky_get):
+            result = real_method(self.mgr, retries=3, per_timeout=(0.5, 1))
+        # Should have succeeded on 3rd attempt
+        self.assertTrue(result)
+        self.assertEqual(call_count[0], 3)
 
     def test_restore_preserves_tabs_in_db(self):
         """Bug fix: restore must NOT clear saved tabs so they survive until

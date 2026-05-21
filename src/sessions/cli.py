@@ -38,7 +38,9 @@ log = logging.getLogger("sessions")
 def setup_logging(debug: bool = False, log_path: str | None = None) -> None:
     level = logging.DEBUG if debug else logging.WARNING
     if debug:
-        path = log_path or os.path.join(SCRIPT_DIR, "debug.log")
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        path = log_path or os.path.join(temp_dir, "sessions_debug.log")
         handler = logging.FileHandler(path, mode="a", encoding="utf-8")
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)s %(name)s  %(message)s"))
@@ -179,7 +181,11 @@ def cmd_start(args) -> int:
 
     # ---- foreground mode: the actual server ----
     _debug = getattr(args, "debug", False)
-    _log_path = os.path.join(SCRIPT_DIR, "debug.log") if _debug else None
+    if _debug:
+        import tempfile
+        _log_path = os.path.join(tempfile.gettempdir(), "sessions_debug.log")
+    else:
+        _log_path = None
     setup_logging(_debug, _log_path)
     log.debug("cmd_start api_port=%s browser_port=%s", args.api_port, args.browser_port)
     # Stop any existing daemon on this port only if something is listening.
@@ -333,7 +339,24 @@ def cmd_start(args) -> int:
         try:
             if stop_evt.is_set():
                 return
-            log.warning("recover_chrome: Chrome died unexpectedly, attempting restart")
+            # --- Grace period: verify Chrome is truly dead ----------------
+            # After sleep/wake Chrome can be sluggish but alive.  Wait a few
+            # seconds and re-check before force-killing a healthy browser.
+            log.warning("recover_chrome: Chrome appears dead, verifying "
+                        "with grace period…")
+            import time as _time
+            for attempt in range(3):
+                _time.sleep(2)
+                if manager._chrome_http_reachable(retries=2,
+                                                  per_timeout=(2, 5)):
+                    log.warning("recover_chrome: Chrome became reachable "
+                                "after %ds grace, aborting recovery",
+                                (attempt + 1) * 2)
+                    manager._invalidate_browser_session()
+                    manager._snapshot_cdp_failures = 0
+                    return
+            log.warning("recover_chrome: Chrome confirmed dead after "
+                        "grace period, proceeding with restart")
             # 1. Clear in-memory hot map (browser contexts are gone) and
             #    check DB is_active to learn which containers the user
             #    intended to keep alive vs. those already marked for
@@ -384,16 +407,40 @@ def cmd_start(args) -> int:
             # 4. Reopen the dashboard tab
             if not getattr(args, 'no_browser_open', False):
                 manager.open_dashboard_in_default_tab(dash_url)
-            # 5. Restore containers that were genuinely active
-            for cid in restore_cids:
+            # 5. Try reconnecting to existing Chrome contexts first
+            #    (Chrome may restore its own windows after restart).
+            reconnected_cids: set[str] = set()
+            try:
+                # Temporarily mark restore_cids active so
+                # reconnect_to_existing can find them.
+                if restore_cids:
+                    manager.store.mark_active_bulk(restore_cids, True)
+                reconnected = manager.reconnect_to_existing()
+                reconnected_cids = {r["id"] for r in reconnected}
+                if reconnected_cids:
+                    log.debug("recover_chrome: reconnected %d containers "
+                              "to existing Chrome contexts: %s",
+                              len(reconnected_cids), reconnected_cids)
+                # Re-mark any that weren't reconnected as inactive
+                # (restore() below will mark them active).
+                not_reconnected = [c for c in restore_cids
+                                   if c not in reconnected_cids]
+                if not_reconnected:
+                    manager.store.mark_active_bulk(not_reconnected, False)
+            except Exception as e:
+                log.debug("recover_chrome: reconnect_to_existing error: %s", e)
+            # 6. Restore only containers that weren't reconnected
+            remaining = [c for c in restore_cids
+                         if c not in reconnected_cids]
+            for cid in remaining:
                 try:
                     log.debug("recover_chrome: restoring container %s", cid)
                     manager.restore(cid)
                 except Exception as e:
                     log.warning("recover_chrome: restore %s failed: %s", cid, e)
-            log.warning("recover_chrome: recovery complete, %d restored, "
-                        "%d left hibernated",
-                        len(restore_cids), len(skip_cids))
+            log.warning("recover_chrome: recovery complete, %d reconnected, "
+                        "%d restored, %d left hibernated",
+                        len(reconnected_cids), len(remaining), len(skip_cids))
         except Exception as e:
             log.error("recover_chrome: unexpected error: %s", e)
             graceful_exit()
@@ -530,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--headless", action="store_true")
     sp.add_argument("--no-browser-open", action="store_true")
     sp.add_argument("--debug", action="store_true",
-                    help="Write debug output to debug.log in the script directory")
+                    help="Write debug output to sessions_debug.log in the system temp directory")
     sp.add_argument("--foreground", action="store_true",
                     help="Run in foreground (default is to daemonize)")
     sp.add_argument("--no-hotkey", action="store_true",

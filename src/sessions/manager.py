@@ -147,7 +147,12 @@ class ContainerManager:
     _CDP_RECONNECT_DELAY = 1.0  # seconds between attempts
     # Short timeout for the liveness probe — enough for a healthy session
     _CDP_PROBE_TIMEOUT = 5.0
-    _SNAPSHOT_CRASH_FAILURE_THRESHOLD = 2
+    _SNAPSHOT_CRASH_FAILURE_THRESHOLD = 5
+    # Wall-clock gap (seconds) between watcher ticks that indicates a
+    # sleep/wake cycle.  After such a gap, failure counters are reset and
+    # crash recovery is suppressed for a cooldown period.
+    _SLEEP_GAP_SEC = 30
+    _SLEEP_COOLDOWN_SEC = 15
 
     def _browser_session(self) -> _BorrowedSession:
         with self._bs_lock:
@@ -413,8 +418,25 @@ class ContainerManager:
     def _watcher_loop(self) -> None:
         _consecutive_failures = 0
         _tick = 0
+        _last_tick_mono = time.monotonic()
         while not self._watcher_stop.wait(WINDOW_WATCHER_INTERVAL_SEC):
             _tick += 1
+            now_mono = time.monotonic()
+            gap = now_mono - _last_tick_mono
+            _last_tick_mono = now_mono
+            # Detect sleep/wake: wall-clock gap >> expected interval
+            if gap > self._SLEEP_GAP_SEC:
+                log.warning("watcher: detected sleep/wake (gap=%.1fs), "
+                            "resetting failure counters, cooldown %ds",
+                            gap, self._SLEEP_COOLDOWN_SEC)
+                _consecutive_failures = 0
+                self._snapshot_cdp_failures = 0
+                self._dashboard_cdp_failures = getattr(
+                    self, '_dashboard_cdp_failures', 0) and 0
+                self._sleep_cooldown_until = (
+                    now_mono + self._SLEEP_COOLDOWN_SEC)
+                self._invalidate_browser_session()
+                continue  # skip this tick entirely, let Chrome settle
             log.debug("watcher tick %d, hot=%d", _tick, len(self.hot))
             try:
                 self._check_stale_hot()
@@ -436,15 +458,23 @@ class ContainerManager:
             except Exception as e:
                 log.debug("dashboard-alive check error: %s", e)
 
-    def _chrome_http_reachable(self) -> bool:
-        """Quick check: is Chrome's HTTP debug endpoint responding?"""
-        try:
-            cdp.requests.get(
-                f"http://127.0.0.1:{self.browser_port}/json/version",
-                timeout=(0.5, 2))
-            return True
-        except Exception:
-            return False
+    def _chrome_http_reachable(self, retries: int = 3,
+                               per_timeout: tuple[float, float] = (1, 5)
+                               ) -> bool:
+        """Check whether Chrome's HTTP debug endpoint is responding.
+
+        Uses multiple retries with generous timeouts so that a sluggish
+        Chrome waking from sleep is not mistaken for a dead process."""
+        for attempt in range(retries):
+            try:
+                cdp.requests.get(
+                    f"http://127.0.0.1:{self.browser_port}/json/version",
+                    timeout=per_timeout)
+                return True
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(1)
+        return False
 
     def _check_dashboard_alive(self) -> None:
         """If the UI window (dashboard target) was closed, trigger shutdown.
@@ -463,6 +493,10 @@ class ContainerManager:
                 self, '_dashboard_cdp_failures', 0) + 1
             log.debug("dashboard CDP check failed (%d): %s",
                       self._dashboard_cdp_failures, e)
+            # Suppress during post-sleep cooldown — Chrome is alive but slow
+            if self._in_sleep_cooldown():
+                log.debug("dashboard: suppressing crash check during sleep cooldown")
+                return
             if self._dashboard_cdp_failures < 5:
                 # After 2 failures do an early HTTP probe — if Chrome's HTTP is
                 # also unreachable we can skip waiting for 5 WS failures.
@@ -505,6 +539,11 @@ class ContainerManager:
         )
         return any(n in msg for n in needles)
 
+    def _in_sleep_cooldown(self) -> bool:
+        """Return True if we are in the post-sleep cooldown window."""
+        until = getattr(self, '_sleep_cooldown_until', 0)
+        return time.monotonic() < until
+
     def _maybe_trigger_snapshot_crash_recovery(self, cid: str, err: Exception) -> None:
         if not self._on_chrome_crash:
             return
@@ -513,6 +552,11 @@ class ContainerManager:
             return
         self._snapshot_cdp_failures += 1
         if self._snapshot_cdp_failures < self._SNAPSHOT_CRASH_FAILURE_THRESHOLD:
+            return
+        # Suppress during post-sleep cooldown — Chrome is alive but slow
+        if self._in_sleep_cooldown():
+            log.debug("snapshot: suppressing crash recovery during sleep cooldown")
+            self._snapshot_cdp_failures = 0
             return
         if self._chrome_http_reachable():
             return
