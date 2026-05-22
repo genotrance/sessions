@@ -364,8 +364,13 @@ def cmd_start(args) -> int:
             with manager._lock:
                 hot_cids = list(manager.hot.keys())
                 manager.hot.clear()
+                manager._profile_sessions.clear()
             db_active = {c["id"] for c in manager.store.list_containers()
                          if c.get("is_active")}
+            # Rebuild _profile_sessions from DB so restore dispatches correctly
+            for c in manager.store.list_containers():
+                if c.get("session_type") == "profile":
+                    manager._profile_sessions.add(c["id"])
             restore_cids = [c for c in hot_cids if c in db_active]
             skip_cids = [c for c in hot_cids if c not in db_active]
             for cid in hot_cids:
@@ -467,6 +472,8 @@ def cmd_start(args) -> int:
                 log.error("_post_start: Chrome failed to start: %s", _chrome_error[0])
                 return
             log.debug("_post_start running")
+            if _chrome_ref:
+                manager._chrome_mgr = _chrome_ref[0]
             if not getattr(args, "no_browser_open", False):
                 manager.open_dashboard_in_default_tab(dash_url)
             if _keyboard and not getattr(args, "no_hotkey", False):

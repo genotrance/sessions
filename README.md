@@ -2,15 +2,20 @@
 
 **Isolated browser profiles that remember everything.**
 
-Sessions lets you run multiple isolated browsing profiles in a single Chrome (or Edge) window. Each session keeps its own cookies, logins, localStorage, and IndexedDB — so you can stay signed in to several accounts at once, or keep work and personal browsing completely separate.
+Sessions lets you run multiple isolated browsing sessions in Chrome (or Edge). Each session keeps its own cookies, logins, localStorage, and IndexedDB — so you can stay signed in to several accounts at once, or keep work and personal browsing completely separate.
 
-When you're done, hibernate a session to free memory. Its tabs, cookies, and site data are saved to disk and restored exactly where you left off — even after a reboot.
+Two types of sessions:
+
+- **Session** — A full Chrome profile with persistent login, extensions, and passkey support. Best for sites that need long-lived authentication (Gmail, Okta, etc.).
+- **Lite Session** — A lightweight CDP browser context with snapshotted state. Fast to create and low on resources, ideal for casual browsing.
+
+When you're done, hibernate a session to free memory. Its tabs and data are saved and restored exactly where you left off — even after a reboot.
 
 ## Why?
 
-Chrome's built-in profiles are heavyweight. Incognito windows forget everything when closed. Extensions like containers are limited and can't save IndexedDB or restore tabs with full state.
+Chrome's built-in profiles are heavyweight and hard to manage. Incognito windows forget everything when closed. Extensions like containers are limited and can't save IndexedDB or restore tabs with full state.
 
-Sessions fills the gap: lightweight isolated contexts with full state persistence, managed from a simple dashboard.
+Sessions fills the gap: a hybrid of full Chrome profiles and lightweight isolated contexts, all managed from a simple dashboard.
 
 ## Quick Start
 
@@ -48,7 +53,8 @@ pip install -e .
 
 ### Creating and browsing
 
-- **+ New** — Creates a new isolated session. A fresh Chrome window opens where you can navigate to any site, log in, and use it normally.
+- **+Session** (blue button) — Creates a full Chrome profile session. Supports persistent login, extensions, and passkeys. Chrome populates the profile on first launch. Note: profile windows appear as separate taskbar entries on Windows — this is inherent to Chrome's profile system.
+- **+Lite Session** (green button) — Creates a lightweight isolated session, ideal for casual browsing.
 - **Click a tab** in the dashboard to focus it in Chrome. For hibernated sessions, clicking a tab restores the session and opens that URL.
 
 ### Managing sessions
@@ -67,7 +73,9 @@ Use the checkboxes next to each session (or the select-all checkbox) to select m
 
 ### Dashboard layout
 
-The dashboard splits into two columns — **Active** sessions on the left and **Hibernated** on the right. Each session has a green (active) or yellow (hibernated) left border for quick identification.
+The dashboard splits into two columns — **Active** sessions on the left and **Hibernated** on the right.
+
+Active sessions have a **green** left border; hibernated sessions have a **blue** left border.
 
 ### Search and keyboard navigation
 
@@ -79,15 +87,16 @@ Right-click any session for a context menu with **Restore**, **Hibernate**, **Cl
 
 ## Features
 
-- **Isolated profiles** — Each session has its own cookies, localStorage, IndexedDB, and browsing context.
-- **Full state persistence** — Sessions are saved to a local SQLite database including cookies, storage, and open tabs.
+- **Two session types** — Full profile sessions for persistent login and extensions, plus lightweight Lite Sessions for casual browsing.
+- **Session isolation** — Each session has its own cookies, localStorage, IndexedDB, and browsing context.
+- **Full state persistence** — Lite Sessions save cookies, storage, and tabs to SQLite. Sessions use Chrome's native profile storage.
 - **Auto-save** — Running sessions are periodically snapshotted so nothing is lost if Chrome crashes.
 - **Auto-hibernate** — Closing a browser window automatically hibernates the session.
-- **Move tabs between sessions** — Cut a tab from any session and paste it into another, transferring cookies, localStorage, and IndexedDB for that origin.
+- **Move tabs between sessions** — Cut a tab from any session and paste it into another. Works across session types.
 - **Tab restoration** — Hibernated sessions restore all tabs with their original URLs and site data.
-- **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Bulk operations in progress (e.g. hibernate) are honoured — sessions you asked to hibernate stay hibernated.
+- **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Profile sessions are re-launched and Lite Sessions are restored from snapshots.
 - **Cross-platform** — Works on Windows, macOS, and Linux with Chrome or Edge.
-- **Two-column dashboard** — Active sessions on the left, hibernated on the right, each with a colored left border.
+- **Two-column dashboard** — Active sessions on the left, hibernated on the right, with green/blue borders.
 - **Dashboard UI** — A lightweight web dashboard for managing sessions from any tab.
 - **Keyboard hotkey** — Press `Win+/` (Windows) or `Ctrl+/` (macOS/Linux) to open the dashboard instantly. Disable with `--no-hotkey` if it conflicts with other software.
 

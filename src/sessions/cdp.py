@@ -9,6 +9,7 @@ Exposes only the CDP surface required by ``context_daemon.py``:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import signal
@@ -21,6 +22,8 @@ from typing import Any
 
 import requests
 import websocket
+
+log = logging.getLogger("sessions")
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -147,6 +150,31 @@ CHROME_PATH, _DEFAULT_BROWSER_NAME = find_browser("auto")
 USER_DATA_DIR = _default_data_dir()
 PID_FILE = _default_pid_file()
 
+_BASE_PROFILE_DIR = "sessions-default"
+
+
+def _migrate_base_profile(user_data_dir: str) -> None:
+    """Rename ``Default`` → ``sessions-default`` if needed.
+
+    Chrome stores per-profile preference HMACs in the Windows registry
+    under ``HKCU\\Software\\Google\\Chrome\\PreferenceMACs\\<profile-dir>``.
+    Using ``Default`` as the profile directory name collides with the
+    user's real Chrome installation, causing HMAC mismatches that silently
+    disable user-installed extensions on every restart.
+
+    Renaming to ``sessions-default`` gives Sessions its own registry
+    namespace.  This migration runs once, before Chrome is started.
+    """
+    src = os.path.join(user_data_dir, "Default")
+    dst = os.path.join(user_data_dir, _BASE_PROFILE_DIR)
+    if os.path.isdir(src) and not os.path.isdir(dst):
+        try:
+            os.rename(src, dst)
+            log.info("Migrated base profile: Default → %s", _BASE_PROFILE_DIR)
+        except OSError:
+            log.warning("Failed to rename Default → %s", _BASE_PROFILE_DIR,
+                        exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # ChromeManager
@@ -184,17 +212,18 @@ class ChromeManager:
             raise RuntimeError(
                 f"Browser binary not found (tried: {self.chrome_path!r}). "
                 "Install Chrome or Edge.")
+        _migrate_base_profile(self.user_data_dir)
+        cleanup_stale_profiles(self.user_data_dir)
         args = [
             self.chrome_path,
             f"--remote-debugging-port={self.port}",
             f"--user-data-dir={self.user_data_dir}",
+            f"--profile-directory={_BASE_PROFILE_DIR}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-default-apps",
             "--disable-popup-blocking",
             "--disable-translate",
-            "--disable-background-networking",
-            "--disable-sync",
             "--disable-breakpad",
             "--metrics-recording-only",
             "--remote-allow-origins=*",
@@ -323,6 +352,40 @@ class ChromeManager:
         except OSError:
             pass
 
+    def launch_profile(self, profile_name: str,
+                       start_url: str = "about:blank") -> None:
+        """Open a Chrome profile window in the already-running Chrome instance.
+
+        Chrome's singleton IPC mechanism detects the existing process and sends
+        the profile-open command to it, so no new process is spawned.
+        """
+        if not self.chrome_path:
+            raise RuntimeError("No browser binary configured")
+        args = [
+            self.chrome_path,
+            f"--user-data-dir={self.user_data_dir}",
+            f"--profile-directory={profile_name}",
+            start_url,
+        ]
+        log.debug("launch_profile: %s", " ".join(args))
+        popen_kwargs: dict[str, Any] = {"stdout": subprocess.PIPE,
+                                        "stderr": subprocess.PIPE}
+        if IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(args, **popen_kwargs)
+        # Wait briefly for IPC handoff; log result for debugging
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+            log.debug("launch_profile: exited %d stdout=%r stderr=%r",
+                      proc.returncode,
+                      stdout[:500] if stdout else b"",
+                      stderr[:500] if stderr else b"")
+        except subprocess.TimeoutExpired:
+            log.debug("launch_profile: process still running after 5s (pid=%d)",
+                      proc.pid)
+
 
 def ensure_chrome(port: int = DEFAULT_PORT, headless: bool = False,
                   **kwargs) -> ChromeManager:
@@ -334,6 +397,290 @@ def ensure_chrome(port: int = DEFAULT_PORT, headless: bool = False,
     start_kw = {k: v for k, v in kwargs.items()
                 if k in ("extra_args", "start_url", "timeout")}
     return mgr.start(headless=headless, **start_kw)
+
+
+# ---------------------------------------------------------------------------
+# Profile directory helpers (for profile-backed sessions)
+# ---------------------------------------------------------------------------
+
+_PROFILE_PREFIX = "sessions-"
+_SHADOW_TABS_FILE = "sessions_tabs.json"
+
+
+def profile_dir_name(cid: str) -> str:
+    """Return the Chrome profile directory name for a container id."""
+    return f"{_PROFILE_PREFIX}{cid}"
+
+
+def profile_dir_path(user_data_dir: str, cid: str) -> str:
+    """Return the full path to a profile directory."""
+    return os.path.join(user_data_dir, profile_dir_name(cid))
+
+
+_EXT_DIRS = (
+    "Extensions",
+    "Extension Rules",
+    "Extension Scripts",
+    "Extension State",
+    "DNR Extension Rules",
+    "Local Extension Settings",
+)
+
+
+def _find_base_profile(user_data_dir: str) -> str | None:
+    """Return the path to the base profile (``sessions-default``, ``Default``,
+    or first ``Profile N``)."""
+    for name in (_BASE_PROFILE_DIR, "Default"):
+        path = os.path.join(user_data_dir, name)
+        if os.path.isdir(path):
+            return path
+    for entry in sorted(os.listdir(user_data_dir)):
+        if entry.startswith("Profile ") and os.path.isdir(
+                os.path.join(user_data_dir, entry)):
+            return os.path.join(user_data_dir, entry)
+    return None
+
+
+def _copy_extensions(base_profile: str, dest_profile: str) -> None:
+    """Copy extension files and state from *base_profile* to *dest_profile*.
+
+    Copies the ``Extensions/`` directory (static CRX content), the
+    ``Secure Preferences`` file (which holds per-extension metadata with
+    HMAC integrity data), and the LevelDB-backed extension state
+    directories — skipping ``LOCK`` / ``LOG`` files so that Chrome can
+    open the databases cleanly in the new profile.
+
+    Chrome validates preference HMACs against per-profile registry
+    keys (``HKCU\\Software\\Google\\Chrome\\PreferenceMACs\\<dir>``).  Each
+    ``sessions-*`` profile has its own registry namespace, so the
+    copied ``Secure Preferences`` passes validation in the new profile.
+    """
+    def _ignore_locks(_dir: str, files: list[str]) -> list[str]:
+        return [f for f in files if f in ("LOCK", "LOG", "LOG.old")]
+
+    copied: list[str] = []
+    for dirname in _EXT_DIRS:
+        src = os.path.join(base_profile, dirname)
+        dst = os.path.join(dest_profile, dirname)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, ignore=_ignore_locks)
+            copied.append(dirname)
+
+    # Copy Secure Preferences (contains extension entries + valid HMACs)
+    sp_src = os.path.join(base_profile, "Secure Preferences")
+    if os.path.isfile(sp_src):
+        shutil.copy2(sp_src, os.path.join(dest_profile, "Secure Preferences"))
+        copied.append("Secure Preferences")
+
+    log.debug("_copy_extensions: copied %s from %s", copied, base_profile)
+
+
+def create_profile_dir(user_data_dir: str, cid: str) -> str:
+    """Create a Chrome profile directory with extensions from the base profile.
+
+    1. Copies the base ``Preferences`` (which contains ``install_signature``
+       and other extension metadata Chrome requires) then overrides the
+       ``session`` and ``profile`` keys.
+    2. Copies extensions and their state from the base profile so that the
+       new profile starts with the same extensions already installed.
+
+    Returns the full path to the created directory.
+    """
+    path = profile_dir_path(user_data_dir, cid)
+    prefs_path = os.path.join(path, "Preferences")
+    if os.path.isdir(path) and os.path.isfile(prefs_path):
+        return path
+
+    os.makedirs(path, exist_ok=True)
+
+    # Start from the base Preferences (carries install_signature and
+    # other extension metadata) if available, otherwise create minimal.
+    base = _find_base_profile(user_data_dir)
+    base_prefs_path = os.path.join(base, "Preferences") if base else None
+    if base_prefs_path and os.path.isfile(base_prefs_path):
+        try:
+            with open(base_prefs_path, encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            prefs = {}
+    else:
+        prefs = {}
+    prefs["session"] = {"restore_on_startup": 1}
+    prefs.setdefault("profile", {})["name"] = cid
+    # Mark as cleanly exited so Chrome doesn't show "not shut down correctly"
+    prefs["profile"]["exit_type"] = "Normal"
+    prefs["profile"]["exited_cleanly"] = True
+    with open(prefs_path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f)
+
+    # Copy extensions from the base profile
+    if base:
+        try:
+            _copy_extensions(base, path)
+        except OSError:
+            log.warning("create_profile_dir: failed to copy extensions", exc_info=True)
+
+    # Pre-register in Local State so Chrome recognises the profile
+    _register_in_local_state(user_data_dir, cid)
+
+    log.debug("create_profile_dir: created %s", path)
+    return path
+
+
+def delete_profile_dir(user_data_dir: str, cid: str) -> bool:
+    """Delete a profile directory and remove it from Chrome's profile registry.
+
+    Returns True if the directory was deleted.
+    """
+    path = profile_dir_path(user_data_dir, cid)
+    deleted = False
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+        deleted = True
+    # Clean up Chrome's Local State profile registry
+    _remove_from_local_state(user_data_dir, cid)
+    return deleted
+
+
+def cleanup_stale_profiles(user_data_dir: str) -> None:
+    """Remove entries from Local State for profiles that no longer exist on disk.
+
+    Call this before Chrome starts so that deleted profiles don't appear
+    in Chrome's profile picker.
+    """
+    local_state_path = os.path.join(user_data_dir, "Local State")
+    if not os.path.isfile(local_state_path):
+        return
+    try:
+        with open(local_state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    info_cache = state.get("profile", {}).get("info_cache", {})
+    stale = [
+        name for name in list(info_cache)
+        if name.startswith(_PROFILE_PREFIX)
+        and name != _BASE_PROFILE_DIR
+        and not os.path.isdir(os.path.join(user_data_dir, name))
+    ]
+    if not stale:
+        return
+
+    profiles_order = state.get("profile", {}).get("profiles_order", [])
+    last_active = state.get("profile", {}).get("last_active_profiles", [])
+    for name in stale:
+        info_cache.pop(name, None)
+        if name in profiles_order:
+            profiles_order.remove(name)
+        if name in last_active:
+            last_active.remove(name)
+    try:
+        with open(local_state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        log.info("cleanup_stale_profiles: removed %d stale entries: %s",
+                 len(stale), stale)
+    except OSError:
+        pass
+
+
+def _register_in_local_state(user_data_dir: str, cid: str) -> None:
+    """Register a profile in Chrome's Local State so Chrome opens it."""
+    local_state_path = os.path.join(user_data_dir, "Local State")
+    state: dict = {}
+    if os.path.isfile(local_state_path):
+        try:
+            with open(local_state_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            state = {}
+
+    prof_dir = profile_dir_name(cid)
+    profile = state.setdefault("profile", {})
+    info_cache = profile.setdefault("info_cache", {})
+    if prof_dir not in info_cache:
+        info_cache[prof_dir] = {
+            "active_time": time.time(),
+            "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_26",
+            "background_apps": False,
+            "is_consented_primary_account": False,
+            "is_ephemeral": False,
+            "name": cid,
+            "user_name": "",
+        }
+    profiles_order = profile.setdefault("profiles_order", [])
+    if prof_dir not in profiles_order:
+        profiles_order.append(prof_dir)
+
+    try:
+        with open(local_state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def _remove_from_local_state(user_data_dir: str, cid: str) -> None:
+    """Remove a profile entry from Chrome's Local State file."""
+    local_state_path = os.path.join(user_data_dir, "Local State")
+    if not os.path.isfile(local_state_path):
+        return
+    try:
+        with open(local_state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    prof_dir = profile_dir_name(cid)
+    changed = False
+
+    # Remove from profile.info_cache
+    info_cache = state.get("profile", {}).get("info_cache", {})
+    if prof_dir in info_cache:
+        del info_cache[prof_dir]
+        changed = True
+
+    # Remove from profile.profiles_order
+    profiles_order = state.get("profile", {}).get("profiles_order", [])
+    if prof_dir in profiles_order:
+        profiles_order.remove(prof_dir)
+        changed = True
+
+    # Remove from profile.last_active_profiles
+    last_active = state.get("profile", {}).get("last_active_profiles", [])
+    if prof_dir in last_active:
+        last_active.remove(prof_dir)
+        changed = True
+
+    if changed:
+        try:
+            with open(local_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except OSError:
+            pass
+
+
+def save_profile_tabs(user_data_dir: str, cid: str,
+                      tabs: list[dict]) -> None:
+    """Write the shadow tab list for a profile session."""
+    path = os.path.join(profile_dir_path(user_data_dir, cid),
+                        _SHADOW_TABS_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"tabs": tabs}, f)
+
+
+def load_profile_tabs(user_data_dir: str, cid: str) -> list[dict]:
+    """Read the shadow tab list for a profile session."""
+    path = os.path.join(profile_dir_path(user_data_dir, cid),
+                        _SHADOW_TABS_FILE)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("tabs", [])
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 # ---------------------------------------------------------------------------

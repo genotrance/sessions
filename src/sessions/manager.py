@@ -12,7 +12,8 @@ import urllib.parse
 from typing import Any
 
 from . import cdp
-from .cdp import CDPSession, CDPError
+from .cdp import CDPSession, CDPError, profile_dir_name
+from .profile import ProfileMixin
 from .idb import (
     IDB_DUMP_JS,
     IDB_LIST_JS,
@@ -93,7 +94,7 @@ _IDB_SKIP_NAMES: frozenset[str] = frozenset({
 _IDB_DUMP_JS_MODULE = IDB_DUMP_JS
 
 
-class ContainerManager:
+class ContainerManager(ProfileMixin):
     """Maps persisted containers to live browser contexts."""
 
     def __init__(self, browser_port: int = DEFAULT_BROWSER_PORT,
@@ -129,6 +130,10 @@ class ContainerManager:
         # Focus-polling thread: polls document.hasFocus() via CDP flatten sessions
         self._evt_thread: threading.Thread | None = None
         self._evt_stop = threading.Event()  # separate from _watcher_stop
+        # Profile session tracking: cids whose session_type == 'profile'
+        self._profile_sessions: set[str] = set()
+        # Reference to ChromeManager for launching profile windows
+        self._chrome_mgr: cdp.ChromeManager | None = None
 
     # -- low-level CDP helpers ------------------------------------------------
 
@@ -651,10 +656,12 @@ class ContainerManager:
         return empty lists.  The last snapshot's tabs/cookies/storage are
         preserved in the DB."""
         log.debug("_soft_hibernate: cid=%s", cid)
+        is_prof = self.is_profile(cid)
         with self._lock:
             ctx = self.hot.pop(cid, None)
             if ctx:
-                log.debug("_soft_hibernate: disposing context %s", ctx)
+                log.debug("_soft_hibernate: %s context %s",
+                          "releasing profile" if is_prof else "disposing", ctx)
                 with self._new_browser_session() as bs:
                     try:
                         all_targets = bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT)
@@ -666,17 +673,29 @@ class ContainerManager:
                                     pass
                     except Exception:
                         pass
-                    try:
-                        bs.target.dispose_browser_context(ctx)
-                        log.debug("_soft_hibernate: context %s disposed", ctx)
-                    except CDPError as e:
-                        log.debug("_soft_hibernate: dispose CDPError (ignored): %s", e)
+                    if not is_prof:
+                        try:
+                            bs.target.dispose_browser_context(ctx)
+                            log.debug("_soft_hibernate: context %s disposed", ctx)
+                        except CDPError as e:
+                            log.debug("_soft_hibernate: dispose CDPError (ignored): %s", e)
             self.store.mark_active(cid, False)
             log.debug("soft-hibernated %s (preserved last snapshot)", cid)
 
     # -- create / open --------------------------------------------------------
 
-    def create_container(self, name: str, color: str = "#3b82f6") -> dict:
+    def create_container(self, name: str, color: str = "#3b82f6",
+                         session_type: str = "context") -> dict:
+        if session_type == "profile":
+            row = self.store.create_container(
+                name, color, session_type="profile")
+            # profile_dir must match the actual cid (after dedup)
+            self.store.set_profile_dir(row["id"],
+                                       profile_dir_name(row["id"]))
+            row["profile_dir"] = profile_dir_name(row["id"])
+            self._profile_sessions.add(row["id"])
+            cdp.create_profile_dir(self._user_data_dir(), row["id"])
+            return row
         return self.store.create_container(name, color)
 
     def open_tab(self, cid: str, url: str = "about:blank") -> str:
@@ -881,6 +900,11 @@ class ContainerManager:
                 log.debug("snapshot: %s not hot, skipping", cid)
                 return {"id": cid, "skipped": "not-hot"}
             ctx = self.hot[cid]
+
+        # --- Profile session: lightweight tab-only snapshot ---
+        if self.is_profile(cid):
+            return self._snapshot_profile(cid, ctx)
+
         # Collect state WITHOUT holding the lock (CDP calls can be slow)
         try:
             cookies, storage, idb, tabs = self._collect_state(ctx)
@@ -902,11 +926,18 @@ class ContainerManager:
                 log.debug("snapshot: %s unchanged (hash match), skipping write", cid)
                 self._last_snapshot_time[cid] = time.time()  # refresh freshness
                 return {"id": cid, "skipped": "unchanged"}
-            # If storage/IDB collection failed (empty or fewer origins than
-            # previously saved), preserve the last good data per-origin so
-            # a single tab timeout doesn't wipe previously captured state.
+            # If collection returned empty/fewer results than previously
+            # saved, preserve the last good data so a transient CDP failure
+            # (e.g. tabs still loading after restore) doesn't wipe state.
             prev = self.store.get_container(cid)
             if prev:
+                # Tabs: never overwrite non-empty saved tabs with empty
+                prev_tabs = prev.get("tabs", [])
+                if not tabs and prev_tabs:
+                    log.debug("snapshot: 0 live tabs for %s but %d saved, preserving",
+                              cid, len(prev_tabs))
+                    tabs = prev_tabs
+                # Storage: merge per-origin
                 prev_storage = prev.get("storage", {})
                 if prev_storage:
                     merged_storage = dict(prev_storage)
@@ -916,6 +947,7 @@ class ContainerManager:
                         log.debug("snapshot: localStorage missing %d origins for %s, preserving",
                                   preserved, cid)
                     storage = merged_storage
+                # IDB: merge per-origin
                 prev_idb = prev.get("idb", {})
                 if prev_idb:
                     merged_idb = dict(prev_idb)
@@ -1000,6 +1032,11 @@ class ContainerManager:
             if cid not in self.hot:
                 raise RuntimeError(f"container {cid} is not hot")
             ctx = self.hot[cid]
+
+        # --- Profile-backed session hibernate ---
+        if self.is_profile(cid):
+            return self._hibernate_profile(cid, ctx)
+
         # Collect state WITHOUT holding the lock (CDP calls can be slow)
         log.debug("hibernate: collecting state for ctx=%s", ctx)
         cookies, storage, idb, tabs_to_save = self._collect_state(ctx)
@@ -1086,6 +1123,10 @@ class ContainerManager:
                                                 browser_context_id=self.hot[cid])
                 return {"id": cid, "status": "already-hot",
                         "browserContextId": self.hot[cid]}
+
+            # --- Profile-backed session restore ---
+            if row.get("session_type") == "profile":
+                return self._restore_profile(cid, row, also_open_url)
 
             log.debug("restore: creating browser context for %s", cid)
             with self._browser_session() as bs:
@@ -1351,10 +1392,13 @@ class ContainerManager:
 
     def delete(self, cid: str) -> None:
         log.debug("delete cid=%s", cid)
+        is_prof = self.is_profile(cid)
         with self._lock:
             if cid in self.hot:
                 ctx = self.hot.pop(cid)
-                log.debug("delete: disposing context %s for %s", ctx, cid)
+                log.debug("delete: %s context %s for %s",
+                          "closing targets for profile" if is_prof
+                          else "disposing context", ctx, cid)
                 with self._new_browser_session() as bs:
                     try:
                         all_targets = bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT)
@@ -1366,13 +1410,17 @@ class ContainerManager:
                                     pass
                     except Exception:
                         pass
-                    try:
-                        bs.target.dispose_browser_context(ctx)
-                    except CDPError as e:
-                        log.debug("delete: dispose CDPError (ignored): %s", e)
+                    if not is_prof:
+                        try:
+                            bs.target.dispose_browser_context(ctx)
+                        except CDPError as e:
+                            log.debug("delete: dispose CDPError (ignored): %s", e)
             self.store.delete_container(cid)
             self._last_snapshot_time.pop(cid, None)
             self._last_snapshot_hash.pop(cid, None)
+            if is_prof:
+                self._profile_sessions.discard(cid)
+                cdp.delete_profile_dir(self._user_data_dir(), cid)
             log.debug("delete: done cid=%s", cid)
 
     def hibernate_all(self) -> list[dict]:
@@ -1901,20 +1949,29 @@ class ContainerManager:
                     best_ctx = ctx
             if best_ctx and best_score > 0:
                 self.hot[cid] = best_ctx
+                if c.get("session_type") == "profile":
+                    self._profile_sessions.add(cid)
                 # Remove from candidates so no other container claims it
                 del ctx_pages[best_ctx]
                 reconnected.append({"id": cid, "browserContextId": best_ctx,
-                                    "reconnected": True})
+                                    "reconnected": True,
+                                    "session_type": c.get("session_type", "context")})
                 log.debug("reconnected container %s to context %s (%d url matches)",
                           cid, best_ctx, best_score)
         return reconnected
 
     def auto_restore_hot(self) -> list[dict]:
         """Restore containers that were hot when the daemon last shut down."""
+        # Rebuild _profile_sessions from DB before restoring
+        for c in self.store.list_containers():
+            if c.get("session_type") == "profile":
+                self._profile_sessions.add(c["id"])
         results = []
         for c in self.store.list_containers():
             if c.get("is_active"):
-                log.debug("auto-restoring container %s (%s)", c["id"], c["name"])
+                log.debug("auto-restoring container %s (%s) type=%s",
+                          c["id"], c["name"],
+                          c.get("session_type", "context"))
                 try:
                     results.append(self.restore(c["id"]))
                 except Exception as e:

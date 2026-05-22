@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-05-22
+
+### Added
+
+- **Session / Lite Session hybrid model**: Two types of sessions — Sessions (full Chrome profiles with persistent login, extensions, passkey support) and Lite Sessions (lightweight CDP browser contexts with snapshotted state).
+- **+Session button** (blue): Creates a profile-backed session. Chrome populates the new profile on first launch.
+- **+Lite Session button** (green): Creates a lightweight context session (replaces the old "+New" button).
+- **Profile session lifecycle**: Create, restore, hibernate, snapshot, and delete profile-backed sessions. Chrome manages its own data (cookies, extensions, passkeys) on disk; Sessions tracks tab URLs in a shadow tab list.
+- **Profile cleanup on delete**: Deleting a profile session removes it from Chrome's profile menu (Local State cleanup).
+- **Color-coded borders**: Active sessions have a green left border; hibernated sessions have a blue left border.
+- **Cross-type tab movement**: Cut/paste tabs between any combination of Sessions and Lite Sessions.
+- **Crash recovery for profile sessions**: After Chrome restarts, profile sessions are re-launched and their tabs verified/restored from the shadow tab list.
+
+### Fixed
+
+- **Gmail/Okta persistent login**: Removed `--disable-background-networking` and `--disable-sync` Chrome flags that were preventing persistent authentication and passkey support.
+- **Snapshot tab data loss**: Snapshots taken while tabs were still loading would overwrite saved tab URLs with an empty list. Now preserves previously-saved tabs when the live snapshot returns empty.
+- **Profile session creation**: Fixed profile sessions failing to open — profiles are now created minimally (Preferences + Local State registration) and let Chrome populate the rest, avoiding corruption from cloning active LevelDB databases and Secure Preferences HMACs.
+- **Extensions in new profile sessions**: User-installed extensions now load correctly in new profile sessions. The base profile's `Preferences` (including `install_signature` and extension metadata) is copied to new profiles. The base profile is renamed to `sessions-default` to avoid registry MAC key collisions with the user's real Chrome installation.
+- **"Not shut down correctly" warning**: New profile sessions no longer trigger Chrome's crash recovery prompt. The `exit_type` and `exited_cleanly` flags are set correctly in the new profile's Preferences.
+- **Stale profiles in Chrome menu**: Deleted profile sessions are cleaned from Chrome's Local State on startup, so they no longer appear in Chrome's profile picker after a restart.
+- **Profile directory mismatch**: Fixed a bug where the profile directory stored in the database didn't match the actual directory on disk after container ID deduplication, causing Chrome to launch the wrong profile.
+- **Unified color scheme**: Active sessions show a green left border and hibernated sessions show a blue left border, regardless of session type.
+
 ## [0.1.4] - 2026-05-21
 
 ### Fixed

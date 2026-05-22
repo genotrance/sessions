@@ -20,6 +20,8 @@ DASHBOARD_HTML = r"""<!doctype html>
            font-size:13px; }
   button:hover { background:#334155; }
   button.primary { background:#3b82f6; border-color:#3b82f6; color:white; }
+  button.success { background:#16a34a; border-color:#16a34a; color:white; }
+  button.success:hover { background:#15803d; }
   button.danger  { background:#7f1d1d; border-color:#7f1d1d; color:white; }
   button.warm    { background:#92400e; border-color:#92400e; color:white; }
   .bulk-bar { background:#1e293b; border:1px solid #334155;
@@ -51,7 +53,7 @@ DASHBOARD_HTML = r"""<!doctype html>
          border-left:3px solid #334155; transition:border-color 0.2s;
          overflow:hidden; }
   .row.hot  { border-left-color:#22c55e; }
-  .row.cold { border-left-color:#f59e0b; }
+  .row.cold { border-left-color:#3b82f6; }
   .row.selected { outline:2px solid #3b82f6; outline-offset:-2px; }
   .row-cb { flex:0 0 auto; display:flex; align-items:flex-start;
             padding:5px 2px 0 8px; }
@@ -117,7 +119,7 @@ DASHBOARD_HTML = r"""<!doctype html>
                 cursor:pointer; }
   .search-row:hover, .search-row.focused { background:#334155; }
   .search-hot { border-left:3px solid #22c55e; }
-  .search-cold { border-left:3px solid #f59e0b; }
+  .search-cold { border-left:3px solid #3b82f6; }
   .search-session { font-size:12px; color:#64748b; flex:0 0 auto;
                     min-width:24px; text-align:right; }
   /* context menu */
@@ -150,7 +152,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 <div class=sticky-header>
 <h1>Sessions <span class=toolbar>
-  <button class=primary onclick=createSession()>+ New</button>
+  <button class=primary onclick=createProfileSession() title="New session — persistent login, extensions, passkeys">+Session</button>
+  <button class=success onclick=createSession() title="New lightweight session — fast, isolated, good for casual browsing">+Lite Session</button>
   <button onclick=cleanDefault()>Clean</button>
   <button class=warm onclick=restartBackend()>Restart</button>
   <button id=trim-log-btn style=display:none onclick=trimLog()>Trim Log</button>
@@ -392,7 +395,8 @@ function makeTabRow(c, t, isFirst) {
 
 function _buildRow(c) {
   const el = document.createElement('div');
-  el.className = 'row ' + (c.hot ? 'hot' : 'cold') + (selected.has(c.id) ? ' selected' : '');
+  el.className = 'row ' + (c.hot ? 'hot' : 'cold')
+    + (selected.has(c.id) ? ' selected' : '');
   el.dataset.id = c.id;
   el.dataset.hot = c.hot ? '1' : '';
   el.addEventListener('contextmenu', e => showCtxMenu(e, c.id, c.hot));
@@ -641,9 +645,22 @@ async function trimLog() {
   } catch(e) { toast('Trim failed'); }
 }
 async function createSession() {
-  toast('Creating session…');
+  toast('Creating lite session…');
   await api('/api/containers', 'POST', {name: 'session'});
-  toast('Session created');
+  toast('Lite session created');
+  _lastJson = ''; refresh();
+}
+async function createProfileSession() {
+  toast('Creating session…');
+  const c = await api('/api/containers', 'POST', {name: 'session', session_type: 'profile'});
+  _lastJson = ''; refresh();
+  if (c && c.id) {
+    toast('Opening session (may take a moment)…', 15000);
+    try {
+      await api(`/api/containers/${c.id}/restore`, 'POST');
+      toast('Session opened');
+    } catch(e) { toast('Session created but open failed — try Restore again', 5000); }
+  } else { toast('Session created'); }
   _lastJson = ''; refresh();
 }
 async function activate(targetId) {

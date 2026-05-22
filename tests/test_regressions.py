@@ -220,9 +220,9 @@ class TestDashboardHotColdIndicator(unittest.TestCase):
         from sessions.dashboard import DASHBOARD_HTML
         self.assertIn(".row.hot", DASHBOARD_HTML)
         self.assertIn(".row.cold", DASHBOARD_HTML)
-        # Hot = green border, Cold = amber border
+        # Hot = green border, Cold = blue border
         self.assertIn("#22c55e", DASHBOARD_HTML)
-        self.assertIn("#f59e0b", DASHBOARD_HTML)
+        self.assertIn("#3b82f6", DASHBOARD_HTML)
 
     def test_dashboard_js_applies_hot_cold_class(self):
         """renderList must apply 'hot' or 'cold' class based on c.hot."""

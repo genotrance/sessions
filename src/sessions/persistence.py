@@ -91,6 +91,10 @@ class PersistenceManager:
             if "last_accessed_at" not in cols:
                 c.execute("ALTER TABLE containers ADD COLUMN last_accessed_at INTEGER DEFAULT 0")
                 c.execute("UPDATE containers SET last_accessed_at = created_at WHERE last_accessed_at = 0")
+            if "session_type" not in cols:
+                c.execute("ALTER TABLE containers ADD COLUMN session_type TEXT NOT NULL DEFAULT 'context'")
+            if "profile_dir" not in cols:
+                c.execute("ALTER TABLE containers ADD COLUMN profile_dir TEXT DEFAULT NULL")
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path)
@@ -104,7 +108,9 @@ class PersistenceManager:
         return s or f"ctr-{int(time.time())}"
 
     def create_container(self, name: str, color: str = "#3b82f6",
-                         cid: str | None = None) -> dict:
+                         cid: str | None = None,
+                         session_type: str = "context",
+                         profile_dir: str | None = None) -> dict:
         base_slug = cid or self.slugify(name)
         with self._lock, self._conn() as c:
             cid = base_slug
@@ -112,14 +118,17 @@ class PersistenceManager:
             while c.execute("SELECT 1 FROM containers WHERE id=?", (cid,)).fetchone():
                 n += 1
                 cid = f"{base_slug}-{n}"
-            c.execute("INSERT INTO containers(id, name, color) VALUES (?,?,?)",
-                      (cid, name, color))
+            c.execute(
+                "INSERT INTO containers(id, name, color, session_type, profile_dir) "
+                "VALUES (?,?,?,?,?)",
+                (cid, name, color, session_type, profile_dir))
         return self.get_container(cid)
 
     def list_containers(self) -> list[dict]:
         with self._lock, self._conn() as c:
             rows = c.execute(
-                "SELECT id, name, color, is_active, created_at, last_accessed_at FROM containers "
+                "SELECT id, name, color, is_active, created_at, last_accessed_at, "
+                "session_type, profile_dir FROM containers "
                 "ORDER BY created_at ASC").fetchall()
             out = []
             for r in rows:
@@ -170,6 +179,11 @@ class PersistenceManager:
     def reset_all_active(self) -> None:
         with self._lock, self._conn() as c:
             c.execute("UPDATE containers SET is_active=0")
+
+    def set_profile_dir(self, cid: str, profile_dir: str) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE containers SET profile_dir=? WHERE id=?",
+                      (profile_dir, cid))
 
     def mark_active(self, cid: str, active: bool) -> None:
         with self._lock, self._conn() as c:

@@ -70,11 +70,14 @@ class _ApiHandler(BaseHTTPRequestHandler):
             if url:
                 return self._send_json(self.manager.create_for_url(url, color))
             name = b.get("name") or "session"
-            c = self.manager.create_container(name, color)
-            try:
-                self.manager.restore(c["id"])
-            except Exception:
-                pass
+            session_type = b.get("session_type", "context")
+            c = self.manager.create_container(name, color,
+                                              session_type=session_type)
+            if session_type != "profile":
+                try:
+                    self.manager.restore(c["id"])
+                except Exception:
+                    pass
             return self._send_json(c)
         if method == "POST" and path == "/api/activate":
             tid = self._body().get("targetId", "")

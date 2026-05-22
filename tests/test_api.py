@@ -339,7 +339,9 @@ class TestDashboardContent(unittest.TestCase):
 
     def test_has_new_button(self):
         self.assertIn('createSession()', self.html)
-        self.assertIn('+ New', self.html)
+        self.assertIn('createProfileSession()', self.html)
+        self.assertIn('+Session', self.html)
+        self.assertIn('+Lite Session', self.html)
 
     def test_has_session_checkbox(self):
         """Each session row has a checkbox for selection (Gmail-style)."""

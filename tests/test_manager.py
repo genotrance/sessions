@@ -331,6 +331,31 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
         full = self.store.get_container(c["id"])
         self.assertEqual(full["is_active"], 1)
 
+    def test_snapshot_preserves_tabs_when_collect_returns_empty(self):
+        """Regression: if _collect_state returns 0 tabs (e.g. tabs still
+        loading after restore), the snapshot must NOT overwrite previously-
+        saved tabs with an empty list."""
+        c = self.store.create_container("guard")
+        saved_tabs = [
+            {"url": "https://example.com/page1", "title": "P1"},
+            {"url": "https://example.com/page2", "title": "P2"},
+        ]
+        self.store.save_hibernation(c["id"], [], {}, saved_tabs)
+        self.mgr.restore(c["id"])
+        ctx = self.mgr.hot[c["id"]]
+        # Remove all page targets to simulate "tabs still loading"
+        for tid in list(self.fb.targets):
+            t = self.fb.targets[tid]
+            if t.get("browserContextId") == ctx and t.get("type") == "page":
+                del self.fb.targets[tid]
+        result = self.mgr.snapshot(c["id"])
+        self.assertIn("tabs_saved", result)
+        # Tabs must be preserved from previous save
+        self.assertEqual(result["tabs_saved"], 2)
+        full = self.store.get_container(c["id"])
+        self.assertEqual(len(full["tabs"]), 2)
+        self.assertEqual(full["tabs"][0]["url"], "https://example.com/page1")
+
     def test_snapshot_cold_skipped(self):
         c = self.store.create_container("cold-snap")
         result = self.mgr.snapshot(c["id"])
