@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - **Type-based color scheme**: Lite Sessions always have a green left border and Sessions always have a blue left border, regardless of active/hibernated state.
 - **Profile restore extra tabs**: Restoring a profile session no longer opens an extra `about:blank` tab; clicking a specific tab no longer opens a duplicate.
 - **Profile snapshot tab loss**: Profile snapshots no longer overwrite saved tabs with an empty list when the browser window is mid-close or still loading.
+- **Move tab to/from profile sessions**: Moving tabs to or from hot profile sessions now works correctly. Profile contexts are native Chrome contexts that CDP can't target directly, so tab moves use `launch_profile` instead.
 
 ## [0.1.4] - 2026-05-21
 

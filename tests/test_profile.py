@@ -391,7 +391,10 @@ class TestCrossTypeTabMove(_PatchedManagerMixin, unittest.TestCase):
     def _setup_hot(self, name, session_type="context"):
         """Create a container and make it hot with a seeded tab."""
         if session_type == "profile":
-            self.mgr._chrome_mgr = type("CM", (), {"user_data_dir": self.tmp})()
+            self.mgr._chrome_mgr = type("CM", (), {
+                "user_data_dir": self.tmp,
+                "launch_profile": lambda self, p, start_url="about:blank": None,
+            })()
         c = self.mgr.create_container(name, session_type=session_type)
         cid = c["id"]
         ctx = f"CTX-{name.upper()}"
@@ -434,6 +437,30 @@ class TestCrossTypeTabMove(_PatchedManagerMixin, unittest.TestCase):
         self.fb.seed_tab(src_ctx, "https://example.com", "Ex")
         result = self.mgr.move_tab(src, dst, url="https://example.com")
         self.assertNotIn("error", result)
+
+    def test_move_cold_lite_to_hot_profile(self):
+        """Move tab from cold Lite Session to hot Session (profile)."""
+        src = self.mgr.create_container("cold-src")
+        self.store.save_hibernation(src["id"], [], {},
+                                    [{"url": "https://example.com", "title": "Ex"}])
+        dst, dst_ctx = self._setup_hot("pdst", session_type="profile")
+        result = self.mgr.move_tab(src["id"], dst, url="https://example.com")
+        self.assertNotIn("error", result)
+        self.assertTrue(result.get("moved"))
+
+    def test_move_cold_profile_to_hot_profile(self):
+        """Move tab from cold Session (profile) to hot Session (profile)."""
+        self.mgr._chrome_mgr = type("CM", (), {
+            "user_data_dir": self.tmp,
+            "launch_profile": lambda self, p, start_url="about:blank": None,
+        })()
+        src = self.mgr.create_container("cold-psrc", session_type="profile")
+        self.store.save_hibernation(src["id"], [], {},
+                                    [{"url": "https://example.com", "title": "Ex"}])
+        dst, dst_ctx = self._setup_hot("pdst2", session_type="profile")
+        result = self.mgr.move_tab(src["id"], dst, url="https://example.com")
+        self.assertNotIn("error", result)
+        self.assertTrue(result.get("moved"))
 
 
 # ---------------------------------------------------------------------------

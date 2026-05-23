@@ -1739,22 +1739,36 @@ class ContainerManager(ProfileMixin):
 
             # -- Insert into destination ---------------------------------------
             if dest_hot:
+                dest_is_profile = self.is_profile(dest_cid)
                 dest_ctx = self.hot[dest_cid]
-                storage_by_origin = {origin: tab_storage} if origin and tab_storage else {}
-                idb_by_origin = {origin: tab_idb} if origin and tab_idb else {}
-                if tab_cookies:
-                    try:
-                        clean = [c for c in (_clean_cookie(c) for c in tab_cookies) if c]
-                        if clean:
-                            with self._browser_session() as bs:
-                                bs.storage.set_cookies(clean,
-                                                       browser_context_id=dest_ctx)
-                    except Exception as e:
-                        log.debug("move_tab: cookie inject error: %s", e)
-                new_tid = self._open_tab_with_storage(
-                    dest_ctx, url, storage_by_origin, idb_by_origin,
-                    background=True)
-                log.debug("move_tab: opened %s in dest ctx %s", new_tid, dest_ctx)
+                if dest_is_profile:
+                    # Profile contexts are native Chrome contexts — CDP can't
+                    # createTarget or setCookies on them.  Use launch_profile
+                    # to open the URL in the profile's window instead.
+                    chrome_mgr = self._chrome_mgr
+                    if chrome_mgr:
+                        dest_row = self.store.get_container(dest_cid)
+                        prof_name = ((dest_row or {}).get("profile_dir")
+                                     or profile_dir_name(dest_cid))
+                        chrome_mgr.launch_profile(prof_name, start_url=url)
+                    new_tid = ""
+                    log.debug("move_tab: launched url in profile %s", dest_cid)
+                else:
+                    storage_by_origin = {origin: tab_storage} if origin and tab_storage else {}
+                    idb_by_origin = {origin: tab_idb} if origin and tab_idb else {}
+                    if tab_cookies:
+                        try:
+                            clean = [c for c in (_clean_cookie(c) for c in tab_cookies) if c]
+                            if clean:
+                                with self._browser_session() as bs:
+                                    bs.storage.set_cookies(clean,
+                                                           browser_context_id=dest_ctx)
+                        except Exception as e:
+                            log.debug("move_tab: cookie inject error: %s", e)
+                    new_tid = self._open_tab_with_storage(
+                        dest_ctx, url, storage_by_origin, idb_by_origin,
+                        background=True)
+                    log.debug("move_tab: opened %s in dest ctx %s", new_tid, dest_ctx)
             else:
                 if not src_hot:
                     # cold→cold: atomic DB move (insert + delete in one txn)
