@@ -80,6 +80,16 @@ class ProfileMixin:
             if self._last_snapshot_hash.get(cid) == state_hash:
                 self._last_snapshot_time[cid] = time.time()
                 return {"id": cid, "skipped": "unchanged"}
+            # Never overwrite non-empty saved tabs with an empty list
+            # (tabs may appear empty when the window is mid-close or loading)
+            if not tabs:
+                prev = self.store.get_container(cid)
+                prev_tabs = prev.get("tabs", []) if prev else []
+                if prev_tabs:
+                    log.debug("_snapshot_profile: 0 live tabs for %s but "
+                              "%d saved, preserving", cid, len(prev_tabs))
+                    self._last_snapshot_time[cid] = time.time()
+                    return {"id": cid, "skipped": "preserve-tabs"}
             cdp.save_profile_tabs(self._user_data_dir(), cid, tabs)
             # Also update DB tabs for dashboard display
             db_tabs = [{"url": t["url"], "title": t.get("title", "")}
@@ -198,8 +208,17 @@ class ProfileMixin:
         except Exception:
             pass
 
-        # Launch the profile window
-        start_url = also_open_url or "about:blank"
+        # Determine the start URL for Chrome:
+        # - If the caller specified a URL (tab click), use it.
+        # - Otherwise, use the first shadow tab URL so Chrome restores
+        #   it natively (avoids an extra about:blank tab).
+        shadow_tabs = cdp.load_profile_tabs(chrome_mgr.user_data_dir, cid)
+        if also_open_url:
+            start_url = also_open_url
+        elif shadow_tabs:
+            start_url = shadow_tabs[0]["url"]
+        else:
+            start_url = "about:blank"
         chrome_mgr.launch_profile(prof_name, start_url=start_url)
 
         # Discover the new browserContextId
@@ -230,16 +249,20 @@ class ProfileMixin:
         self.store.mark_active(cid, True)
         self.store.touch_accessed(cid)
 
-        # Verify Chrome restored tabs; if not, open from shadow tab list
-        time.sleep(0.5)  # brief wait for Chrome session restore
+        # Wait for Chrome to register the tab in the context.
+        time.sleep(1.5)
         try:
             profile_tabs = self._targets_for(new_ctx)
             live_urls = {t.get("url", "") for t in profile_tabs}
         except Exception:
             live_urls = set()
 
-        shadow_tabs = cdp.load_profile_tabs(chrome_mgr.user_data_dir, cid)
-        if not live_urls - {"about:blank", ""} and shadow_tabs:
+        # Only open shadow tabs if Chrome didn't launch any real tabs AND
+        # we didn't already pass a real URL as start_url (which Chrome is
+        # loading — it just may not have appeared in targets yet).
+        need_shadow = (not live_urls - {"about:blank", ""}
+                       and start_url in ("about:blank", ""))
+        if need_shadow and shadow_tabs:
             log.debug("_restore_profile: Chrome did not restore tabs, "
                       "opening %d from shadow list", len(shadow_tabs))
             with self._browser_session() as bs:

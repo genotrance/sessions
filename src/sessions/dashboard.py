@@ -52,8 +52,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   .row { background:#1e293b; border:1px solid #334155; border-radius:6px;
          border-left:3px solid #334155; transition:border-color 0.2s;
          overflow:hidden; }
-  .row.hot  { border-left-color:#22c55e; }
-  .row.cold { border-left-color:#3b82f6; }
+  .row.type-context { border-left-color:#22c55e; }
+  .row.type-profile { border-left-color:#3b82f6; }
   .row.selected { outline:2px solid #3b82f6; outline-offset:-2px; }
   .row-cb { flex:0 0 auto; display:flex; align-items:flex-start;
             padding:5px 2px 0 8px; }
@@ -118,8 +118,8 @@ DASHBOARD_HTML = r"""<!doctype html>
                 display:flex; align-items:center; gap:8px; padding:6px 10px;
                 cursor:pointer; }
   .search-row:hover, .search-row.focused { background:#334155; }
-  .search-hot { border-left:3px solid #22c55e; }
-  .search-cold { border-left:3px solid #3b82f6; }
+  .search-type-context { border-left:3px solid #22c55e; }
+  .search-type-profile { border-left:3px solid #3b82f6; }
   .search-session { font-size:12px; color:#64748b; flex:0 0 auto;
                     min-width:24px; text-align:right; }
   /* context menu */
@@ -395,7 +395,7 @@ function makeTabRow(c, t, isFirst) {
 
 function _buildRow(c) {
   const el = document.createElement('div');
-  el.className = 'row ' + (c.hot ? 'hot' : 'cold')
+  el.className = 'row type-' + (c.session_type || 'context')
     + (selected.has(c.id) ? ' selected' : '');
   el.dataset.id = c.id;
   el.dataset.hot = c.hot ? '1' : '';
@@ -477,7 +477,7 @@ let _searchFocusIdx = -1;
 
 function _buildSearchRow(c, t, gi, focused) {
   const el = document.createElement('div');
-  el.className = 'search-row' + (focused ? ' focused' : '') + (c.hot ? ' search-hot' : ' search-cold');
+  el.className = 'search-row' + (focused ? ' focused' : '') + ' search-type-' + (c.session_type || 'context');
   el.dataset.matchIdx = gi;
   const label = esc(t.title || trimUrl(t.url));
   const urlLabel = esc(trimUrl(t.url));

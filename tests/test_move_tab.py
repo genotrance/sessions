@@ -586,8 +586,8 @@ class TestDashboardTwoColumnLayout(unittest.TestCase):
         self.assertIn('function _buildSearchRow(', self.html)
 
     def test_search_hot_cold_classes(self):
-        self.assertIn('search-hot', self.html)
-        self.assertIn('search-cold', self.html)
+        self.assertIn('search-type-context', self.html)
+        self.assertIn('search-type-profile', self.html)
 
     def test_browse_items_hot_first(self):
         """Browse items built as hot sessions first, then cold."""

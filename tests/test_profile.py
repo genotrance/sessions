@@ -169,6 +169,34 @@ class TestProfileSnapshot(_PatchedManagerMixin, unittest.TestCase):
         r2 = self.mgr.snapshot(cid)
         self.assertEqual(r2.get("skipped"), "unchanged")
 
+    def test_snapshot_profile_preserves_tabs_when_empty(self):
+        """Profile snapshot must not overwrite saved tabs with empty list."""
+        self.mgr._chrome_mgr = type("CM", (), {"user_data_dir": self.tmp})()
+        c = self.mgr.create_container("Gmail", session_type="profile")
+        cid = c["id"]
+        ctx = "CTX-SNAP-EMPTY"
+        self.mgr.hot[cid] = ctx
+        self.mgr._profile_sessions.add(cid)
+
+        # First snapshot with a real tab
+        self.fb.seed_tab(ctx, "https://gmail.com/inbox", "Inbox")
+        r1 = self.mgr.snapshot(cid)
+        self.assertEqual(r1["tabs_saved"], 1)
+
+        # Simulate window closing: remove all tabs from the fake browser
+        self.fb.targets = {tid: t for tid, t in self.fb.targets.items()
+                           if t.get("browserContextId") != ctx}
+        # Force hash mismatch so the snapshot runs
+        self.mgr._last_snapshot_hash.pop(cid, None)
+
+        r2 = self.mgr.snapshot(cid)
+        self.assertEqual(r2.get("skipped"), "preserve-tabs")
+
+        # DB should still have the original tab
+        full = self.store.get_container(cid)
+        self.assertEqual(len(full["tabs"]), 1)
+        self.assertEqual(full["tabs"][0]["url"], "https://gmail.com/inbox")
+
     def test_snapshot_not_hot(self):
         """Snapshot of non-hot container is skipped."""
         c = self.mgr.create_container("Cold")

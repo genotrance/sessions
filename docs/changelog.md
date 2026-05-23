@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 - **+Lite Session button** (green): Creates a lightweight context session (replaces the old "+New" button).
 - **Profile session lifecycle**: Create, restore, hibernate, snapshot, and delete profile-backed sessions. Chrome manages its own data (cookies, extensions, passkeys) on disk; Sessions tracks tab URLs in a shadow tab list.
 - **Profile cleanup on delete**: Deleting a profile session removes it from Chrome's profile menu (Local State cleanup).
-- **Color-coded borders**: Active sessions have a green left border; hibernated sessions have a blue left border.
+- **Color-coded borders**: Lite Sessions have a green left border; Sessions (profile-backed) have a blue left border.
 - **Cross-type tab movement**: Cut/paste tabs between any combination of Sessions and Lite Sessions.
 - **Crash recovery for profile sessions**: After Chrome restarts, profile sessions are re-launched and their tabs verified/restored from the shadow tab list.
 
@@ -24,7 +24,9 @@ All notable changes to this project will be documented in this file.
 - **"Not shut down correctly" warning**: New profile sessions no longer trigger Chrome's crash recovery prompt. The `exit_type` and `exited_cleanly` flags are set correctly in the new profile's Preferences.
 - **Stale profiles in Chrome menu**: Deleted profile sessions are cleaned from Chrome's Local State on startup, so they no longer appear in Chrome's profile picker after a restart.
 - **Profile directory mismatch**: Fixed a bug where the profile directory stored in the database didn't match the actual directory on disk after container ID deduplication, causing Chrome to launch the wrong profile.
-- **Unified color scheme**: Active sessions show a green left border and hibernated sessions show a blue left border, regardless of session type.
+- **Type-based color scheme**: Lite Sessions always have a green left border and Sessions always have a blue left border, regardless of active/hibernated state.
+- **Profile restore extra tabs**: Restoring a profile session no longer opens an extra `about:blank` tab; clicking a specific tab no longer opens a duplicate.
+- **Profile snapshot tab loss**: Profile snapshots no longer overwrite saved tabs with an empty list when the browser window is mid-close or still loading.
 
 ## [0.1.4] - 2026-05-21
 

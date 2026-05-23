@@ -216,18 +216,18 @@ class TestDashboardHotColdIndicator(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_dashboard_html_has_hot_cold_css(self):
-        """Dashboard CSS must define .row.hot and .row.cold classes."""
+        """Dashboard CSS must define type-based color classes."""
         from sessions.dashboard import DASHBOARD_HTML
-        self.assertIn(".row.hot", DASHBOARD_HTML)
-        self.assertIn(".row.cold", DASHBOARD_HTML)
-        # Hot = green border, Cold = blue border
+        self.assertIn(".row.type-context", DASHBOARD_HTML)
+        self.assertIn(".row.type-profile", DASHBOARD_HTML)
+        # Context = green border, Profile = blue border
         self.assertIn("#22c55e", DASHBOARD_HTML)
         self.assertIn("#3b82f6", DASHBOARD_HTML)
 
     def test_dashboard_js_applies_hot_cold_class(self):
-        """renderList must apply 'hot' or 'cold' class based on c.hot."""
+        """renderList must apply type-based class from session_type."""
         from sessions.dashboard import DASHBOARD_HTML
-        self.assertIn("c.hot", DASHBOARD_HTML)
+        self.assertIn("c.session_type", DASHBOARD_HTML)
 
 
 # ---------------------------------------------------------------------------

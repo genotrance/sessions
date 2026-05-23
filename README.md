@@ -75,7 +75,7 @@ Use the checkboxes next to each session (or the select-all checkbox) to select m
 
 The dashboard splits into two columns — **Active** sessions on the left and **Hibernated** on the right.
 
-Active sessions have a **green** left border; hibernated sessions have a **blue** left border.
+Lite Sessions have a **green** left border; Sessions (profile-backed) have a **blue** left border.
 
 ### Search and keyboard navigation
 
@@ -96,7 +96,7 @@ Right-click any session for a context menu with **Restore**, **Hibernate**, **Cl
 - **Tab restoration** — Hibernated sessions restore all tabs with their original URLs and site data.
 - **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Profile sessions are re-launched and Lite Sessions are restored from snapshots.
 - **Cross-platform** — Works on Windows, macOS, and Linux with Chrome or Edge.
-- **Two-column dashboard** — Active sessions on the left, hibernated on the right, with green/blue borders.
+- **Two-column dashboard** — Active sessions on the left, hibernated on the right. Green borders for Lite Sessions, blue for Sessions.
 - **Dashboard UI** — A lightweight web dashboard for managing sessions from any tab.
 - **Keyboard hotkey** — Press `Win+/` (Windows) or `Ctrl+/` (macOS/Linux) to open the dashboard instantly. Disable with `--no-hotkey` if it conflicts with other software.
 
