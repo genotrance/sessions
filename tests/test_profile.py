@@ -1,7 +1,6 @@
 """Tests for profile-backed session lifecycle."""
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -57,8 +56,6 @@ class TestProfileCreate(_PatchedManagerMixin, unittest.TestCase):
     def test_delete_context_does_not_touch_profile(self):
         """Deleting a context session doesn't try to delete a profile dir."""
         c = self.mgr.create_container("Surf")
-        # Make a hot context first
-        ctx = self.fb.targets  # just need it to be not-hot for delete
         self.mgr.delete(c["id"])
         self.assertIsNone(self.store.get_container(c["id"]))
 
@@ -266,7 +263,6 @@ class TestAutoRestoreProfile(_PatchedManagerMixin, unittest.TestCase):
         # the _profile_sessions set gets populated
         # Use a patched _restore_profile to avoid the Chrome launch
         restored = []
-        original_restore_profile = self.mgr._restore_profile
 
         def mock_restore_profile(cid, row, also_open_url=None):
             self.mgr.hot[cid] = "CTX-MOCK"
@@ -277,7 +273,7 @@ class TestAutoRestoreProfile(_PatchedManagerMixin, unittest.TestCase):
 
         self.mgr._restore_profile = mock_restore_profile
 
-        results = self.mgr.auto_restore_hot()
+        self.mgr.auto_restore_hot()
         self.assertTrue(self.mgr.is_profile(c["id"]))
         self.assertIn(c["id"], restored)
 

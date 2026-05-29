@@ -321,7 +321,7 @@ class TestProfileDirHelpers(unittest.TestCase):
         """Even for an existing profile, registration is ensured."""
         from sessions.cdp import create_profile_dir, profile_dir_name
         import json as _json
-        path = create_profile_dir(self.tmp, "exists")
+        create_profile_dir(self.tmp, "exists")
         # Call again — should still register
         create_profile_dir(self.tmp, "exists")
         ls_path = os.path.join(self.tmp, "Local State")
@@ -366,7 +366,7 @@ class TestProfileDirHelpers(unittest.TestCase):
     def test_cleanup_stale_profiles(self):
         """cleanup_stale_profiles removes entries for missing profile dirs."""
         from sessions.cdp import (cleanup_stale_profiles, create_profile_dir,
-                                   delete_profile_dir, profile_dir_name)
+                                   profile_dir_name)
         import json as _json
         # Create two profiles
         create_profile_dir(self.tmp, "keep-me")
