@@ -981,7 +981,8 @@ class TestConnectTimeoutValues(unittest.TestCase):
     def test_get_targets_cached_connect_timeout_at_least_1s(self):
         """_get_targets_cached connect timeout must be >= 1s to avoid
         false 'Chrome unreachable' on busy systems."""
-        import inspect, re
+        import inspect
+        import re
         src = inspect.getsource(ContainerManager._get_targets_cached)
         m = re.search(r'timeout=\(([0-9.]+),', src)
         self.assertIsNotNone(m, "timeout tuple not found in _get_targets_cached")
@@ -991,7 +992,8 @@ class TestConnectTimeoutValues(unittest.TestCase):
 
     def test_connect_browser_connect_timeout_at_least_1s(self):
         """CDPSession.connect_browser connect timeout must be >= 1s."""
-        import inspect, re
+        import inspect
+        import re
         src = inspect.getsource(cdp.CDPSession.connect_browser)
         m = re.search(r'timeout=\(([0-9.]+),', src)
         self.assertIsNotNone(m, "timeout tuple not found in connect_browser")
