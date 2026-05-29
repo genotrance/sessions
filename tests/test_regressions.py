@@ -896,5 +896,194 @@ class TestFreshSessionPerCollectState(_PatchedManagerMixin, unittest.TestCase):
                       "_collect_state must use _new_browser_session")
 
 
+# ---------------------------------------------------------------------------
+# BUG: origin=null for cert interstitials — storage never collected
+# Tabs showing self-signed HTTPS cert warnings or error pages return "null"
+# from window.location.origin.  The code skipped the tab entirely, losing
+# localStorage/IDB data on every snapshot cycle for hours.
+# FIX: Fall back to computing origin from the tab URL when JS returns "null".
+# ---------------------------------------------------------------------------
+
+class TestOriginNullFallback(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: _collect_state must use computed origin when JS returns 'null'."""
+
+    def test_collect_state_uses_url_origin_when_js_returns_null(self):
+        """When window.location.origin returns 'null' (cert interstitial),
+        _collect_state should fall back to the origin computed from the tab URL
+        and still attempt to collect storage."""
+        c = self.mgr.create_container("NullOrigin")
+        cid = c["id"]
+        self.mgr.restore(cid)
+        ctx = self.mgr.hot[cid]
+        # Seed a tab with real URL + storage, but force null origin
+        tid = self.fb.seed_tab(ctx, "https://172.25.171.110:3001/page", "Self-Signed",
+                               origin="https://172.25.171.110:3001",
+                               storage={"token": "secret"})
+        self.fb.null_origin_tids.add(tid)
+        cookies, storage, idb, tabs = self.mgr._collect_state(ctx)
+        # Tab should NOT be skipped — it should appear in tabs
+        self.assertTrue(any(t["url"] == "https://172.25.171.110:3001/page" for t in tabs))
+        # Storage should be collected using the computed origin
+        self.assertIn("https://172.25.171.110:3001", storage)
+        self.assertEqual(storage["https://172.25.171.110:3001"]["token"], "secret")
+
+    def test_collect_state_skips_when_both_js_and_url_origin_null(self):
+        """If both JS origin and URL-computed origin are unusable, skip the tab."""
+        c = self.mgr.create_container("BothNull")
+        cid = c["id"]
+        self.mgr.restore(cid)
+        ctx = self.mgr.hot[cid]
+        # Seed a tab with about:blank URL and force null origin
+        tid = self.fb.seed_tab(ctx, "about:blank", "Blank")
+        self.fb.null_origin_tids.add(tid)
+        cookies, storage, idb, tabs = self.mgr._collect_state(ctx)
+        # about:blank should be filtered from saveable tabs
+        self.assertEqual(len(tabs), 0)
+
+    def test_snapshot_with_null_origin_tab_collects_storage(self):
+        """Full snapshot round-trip: tab with null JS origin should still
+        have its storage persisted via the URL-derived origin fallback."""
+        c = self.mgr.create_container("SnapNull")
+        cid = c["id"]
+        self.store.save_hibernation(cid, [], {},
+                                    [{"url": "https://10.0.0.1:8443/app", "title": "App"}])
+        self.mgr.restore(cid)
+        ctx = self.mgr.hot[cid]
+        for t in self.fb.targets.values():
+            if t["browserContextId"] == ctx and t["type"] == "page":
+                t["url"] = "https://10.0.0.1:8443/app"
+                self.fb.local_storage[t["targetId"]] = {
+                    "https://10.0.0.1:8443": {"setting": "value"}}
+                self.fb.null_origin_tids.add(t["targetId"])
+        result = self.mgr.snapshot(cid)
+        self.assertIn("tabs_saved", result)
+        full = self.store.get_container(cid)
+        self.assertIn("https://10.0.0.1:8443", full["storage"])
+
+    def test_origin_null_fallback_source_inspection(self):
+        """_collect_state must contain the computed-origin fallback path."""
+        import inspect
+        src = inspect.getsource(ContainerManager._collect_state)
+        self.assertIn("_origin_of(tab_url)", src)
+        self.assertIn("using computed origin", src)
+
+
+# ---------------------------------------------------------------------------
+# BUG: CDP connect timeout too aggressive (0.5s) → false crash detection
+# Chrome under load or waking from sleep may need >0.5s to accept TCP.
+# FIX: Increased connect timeout to 2s in _get_targets_cached and
+# CDPSession.connect_browser.
+# ---------------------------------------------------------------------------
+
+class TestConnectTimeoutValues(unittest.TestCase):
+    """Guard: CDP connect timeouts must not be too aggressive."""
+
+    def test_get_targets_cached_connect_timeout_at_least_1s(self):
+        """_get_targets_cached connect timeout must be >= 1s to avoid
+        false 'Chrome unreachable' on busy systems."""
+        import inspect, re
+        src = inspect.getsource(ContainerManager._get_targets_cached)
+        m = re.search(r'timeout=\(([0-9.]+),', src)
+        self.assertIsNotNone(m, "timeout tuple not found in _get_targets_cached")
+        connect_timeout = float(m.group(1))
+        self.assertGreaterEqual(connect_timeout, 1.0,
+                                f"connect timeout {connect_timeout}s is too aggressive")
+
+    def test_connect_browser_connect_timeout_at_least_1s(self):
+        """CDPSession.connect_browser connect timeout must be >= 1s."""
+        import inspect, re
+        src = inspect.getsource(cdp.CDPSession.connect_browser)
+        m = re.search(r'timeout=\(([0-9.]+),', src)
+        self.assertIsNotNone(m, "timeout tuple not found in connect_browser")
+        connect_timeout = float(m.group(1))
+        self.assertGreaterEqual(connect_timeout, 1.0,
+                                f"connect timeout {connect_timeout}s is too aggressive")
+
+
+# ---------------------------------------------------------------------------
+# BUG: Snapshots ran during crash recovery — wasted CDP calls + log spam
+# FIX: snapshot() and snapshot_all() check _crash_recovery_inflight and skip.
+# ---------------------------------------------------------------------------
+
+class TestSnapshotSkipsDuringCrashRecovery(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: snapshot operations must be suppressed during crash recovery."""
+
+    def test_snapshot_skipped_when_recovery_lock_held(self):
+        """snapshot() must return skip when crash recovery is in progress."""
+        c = self.store.create_container("snap-skip")
+        self.mgr.restore(c["id"])
+        # Acquire the crash recovery lock to simulate in-flight recovery
+        self.mgr._crash_recovery_inflight.acquire()
+        try:
+            result = self.mgr.snapshot(c["id"])
+            self.assertEqual(result.get("skipped"), "crash-recovery")
+        finally:
+            self.mgr._crash_recovery_inflight.release()
+
+    def test_snapshot_all_skipped_when_recovery_lock_held(self):
+        """snapshot_all() must return [] when crash recovery is in progress."""
+        c = self.store.create_container("snap-all-skip")
+        self.mgr.restore(c["id"])
+        self.mgr._crash_recovery_inflight.acquire()
+        try:
+            results = self.mgr.snapshot_all()
+            self.assertEqual(results, [])
+        finally:
+            self.mgr._crash_recovery_inflight.release()
+
+    def test_snapshot_all_skipped_during_sleep_cooldown(self):
+        """snapshot_all() must return [] during the post-sleep cooldown."""
+        c = self.store.create_container("snap-sleep")
+        self.mgr.restore(c["id"])
+        self.mgr._sleep_cooldown_until = time.monotonic() + 60
+        results = self.mgr.snapshot_all()
+        self.assertEqual(results, [])
+
+    def test_snapshot_works_after_recovery_completes(self):
+        """snapshot() must work normally after crash recovery finishes."""
+        c = self.store.create_container("post-recovery")
+        self.store.save_hibernation(c["id"], [], {},
+                                    [{"url": "https://ok.com", "title": "OK"}])
+        self.mgr.restore(c["id"])
+        # Recovery finishes (lock not held)
+        result = self.mgr.snapshot(c["id"])
+        self.assertNotEqual(result.get("skipped"), "crash-recovery")
+
+    def test_snapshot_source_checks_crash_recovery(self):
+        """snapshot() source must check _crash_recovery_inflight.locked()."""
+        import inspect
+        src = inspect.getsource(ContainerManager.snapshot)
+        self.assertIn("_crash_recovery_inflight.locked()", src)
+
+    def test_snapshot_all_source_checks_sleep_cooldown(self):
+        """snapshot_all() must check _in_sleep_cooldown()."""
+        import inspect
+        src = inspect.getsource(ContainerManager.snapshot_all)
+        self.assertIn("_in_sleep_cooldown()", src)
+
+
+# ---------------------------------------------------------------------------
+# BUG: Post-sleep event loop reconnect flood — many attach failures
+# FIX: Added 1s settle delay after reconnect and back-off during recovery.
+# ---------------------------------------------------------------------------
+
+class TestEventLoopReconnectBackoff(unittest.TestCase):
+    """Guard: event loop must back off during crash recovery and settle
+    after reconnect."""
+
+    def test_event_loop_backs_off_during_recovery(self):
+        """_activation_event_loop must check _crash_recovery_inflight."""
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        self.assertIn("_crash_recovery_inflight", src)
+
+    def test_event_loop_has_settle_delay(self):
+        """After reconnect, a brief sleep must precede _rebuild."""
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        # Should have a sleep between connect and rebuild
+        self.assertIn("time.sleep", src)
+
+
 if __name__ == "__main__":
     unittest.main()

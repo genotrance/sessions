@@ -734,7 +734,7 @@ class CDPSession:
         """Connect to the browser-level CDP endpoint (not a tab).
         Required for Target.createBrowserContext / Storage by browserContextId."""
         info = requests.get(f"http://127.0.0.1:{port}/json/version",
-                           timeout=(0.5, 5)).json()
+                           timeout=(2, 5)).json()
         return cls(info["webSocketDebuggerUrl"])
 
     def _next_id(self) -> int:

@@ -220,7 +220,7 @@ class ContainerManager(ProfileMixin):
             return self._targets_cache
         info = cdp.requests.get(
             f"http://127.0.0.1:{self.browser_port}/json/list",
-            timeout=(0.5, 3)).json()
+            timeout=(2, 5)).json()
         self._targets_cache = info
         self._targets_cache_time = now
         return info
@@ -268,6 +268,7 @@ class ContainerManager(ProfileMixin):
 
     _FOCUS_POLL_INTERVAL = 2.0
     _FOCUS_REBUILD_INTERVAL = 30.0
+    _RECONNECT_SETTLE_SEC = 1.0
 
     def _activation_event_loop(self) -> None:
         """Poll document.hasFocus() on each hot tab to track Chrome-native
@@ -393,9 +394,15 @@ class ContainerManager(ProfileMixin):
         while not self._evt_stop.wait(self._FOCUS_POLL_INTERVAL):
             # Reconnect if needed
             if bs is None:
+                # Back off during crash recovery — Chrome is dead/restarting
+                if self._crash_recovery_inflight.locked():
+                    continue
                 bs = _connect()
                 if bs is None:
                     continue
+                # Brief settle time after reconnect lets Chrome's CDP
+                # stabilise, reducing attach failures after sleep/wake.
+                time.sleep(self._RECONNECT_SETTLE_SEC)
                 _rebuild()
                 continue
             # Periodic rebuild to pick up new/closed tabs
@@ -769,9 +776,19 @@ class ContainerManager(ProfileMixin):
                     origin = ts.runtime.evaluate("window.location.origin",
                                                  timeout=SNAPSHOT_CDP_TIMEOUT)
                     if not origin or origin == "null":
-                        log.debug("_collect_state: tab %s origin=%s (url=%s), skipping",
-                                  tid, origin, tab_url)
-                        return None
+                        # Fall back to computing origin from the tab URL.
+                        # Tabs showing cert interstitials or error pages
+                        # return "null" from JS but still have a valid URL
+                        # in the target info.
+                        computed = _origin_of(tab_url) if tab_url else None
+                        if not computed:
+                            log.debug("_collect_state: tab %s origin=%s (url=%s), skipping",
+                                      tid, origin, tab_url)
+                            return None
+                        log.debug("_collect_state: tab %s JS origin=%s, "
+                                  "using computed origin %s from url=%s",
+                                  tid, origin, computed, tab_url)
+                        origin = computed
                     # Use CDP DOMStorage domain to read localStorage.
                     # This bypasses sites (e.g. Discord) that delete
                     # window.localStorage from the JS prototype.
@@ -894,6 +911,11 @@ class ContainerManager(ProfileMixin):
     def snapshot(self, cid: str) -> dict:
         """Persist current state without disposing the context. Crash-safe save."""
         log.debug("snapshot: cid=%s", cid)
+        # Skip if crash recovery is currently in progress — Chrome is dead or
+        # restarting, so CDP calls will just fail and spam the log.
+        if self._crash_recovery_inflight.locked():
+            log.debug("snapshot: %s skipped, crash recovery in progress", cid)
+            return {"id": cid, "skipped": "crash-recovery"}
         # Grab ctx under lock, then release to avoid blocking during CDP calls
         with self._lock:
             if cid not in self.hot:
@@ -974,6 +996,14 @@ class ContainerManager(ProfileMixin):
         Stops the watcher first so it doesn't race with our CDP calls, then
         restarts it when done.
         """
+        # Skip entirely during sleep cooldown or crash recovery — Chrome is
+        # sluggish or dead, so all snapshots would time out or fail.
+        if self._in_sleep_cooldown():
+            log.debug("snapshot_all: skipped, in sleep cooldown")
+            return []
+        if self._crash_recovery_inflight.locked():
+            log.debug("snapshot_all: skipped, crash recovery in progress")
+            return []
         watcher_was_running = (
             self._watcher_thread is not None and self._watcher_thread.is_alive()
         )

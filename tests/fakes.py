@@ -35,6 +35,9 @@ class FakeBrowser:
         # targetId -> list[script sources injected via addScriptToEvaluateOnNewDocument]
         self.new_doc_scripts: dict[str, list[str]] = {}
         self.disposed: list[str] = []
+        # Set of targetIds that should return "null" for window.location.origin
+        # (simulates cert interstitials, sandboxed pages, etc.)
+        self.null_origin_tids: set[str] = set()
         self._ctx_counter = 0
         self._target_counter = 0
 
@@ -202,6 +205,9 @@ class _FakeRuntimeDomain:
     def evaluate(self, expression: str, **_):
         # Hand-rolled responses for the queries the daemon issues.
         if "window.location.origin" in expression:
+            # Simulate tabs that return "null" origin (cert interstitials, etc.)
+            if self.tid in self.fb.null_origin_tids:
+                return "null"
             url = self.fb.targets.get(self.tid, {}).get("url", "")
             if not url or url == "about:blank":
                 return "null"

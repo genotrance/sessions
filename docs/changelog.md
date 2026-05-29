@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-05-28
+
+### Fixed
+
+- **Self-signed HTTPS storage loss**: Tabs at self-signed HTTPS URLs (e.g. `https://172.25.171.110:3001/`) returned `"null"` from `window.location.origin` (cert interstitial), causing localStorage/IDB to never be collected on every snapshot cycle. Now falls back to computing the origin from the tab URL.
+- **False "Chrome unreachable" after sleep**: CDP connect timeout was 0.5s, too aggressive for Chrome recovering from sleep or under load. Increased to 2s, reducing false crash recovery triggers.
+- **Snapshot spam during crash recovery**: Snapshots continued firing while Chrome was dead/restarting, generating failed CDP calls and log noise. Now skipped when crash recovery is in progress.
+- **Snapshot timeouts after sleep/wake**: `snapshot_all` ran immediately after wake when Chrome was sluggish, causing all snapshots to time out. Now skipped during the post-sleep cooldown window.
+- **Post-sleep event loop log flood**: After sleep/wake, the focus-polling event loop reconnected and immediately tried to attach all targets, producing many "socket is already closed" errors. Added a settle delay after reconnect and back-off during crash recovery.
+
 ## [0.2.0] - 2026-05-22
 
 ### Added

@@ -929,6 +929,7 @@ class TestActivationEventLoop(_PatchedManagerMixin, unittest.TestCase):
         """Start the activation loop, run for *duration* seconds, then stop."""
         self.mgr._FOCUS_POLL_INTERVAL = 0.1
         self.mgr._FOCUS_REBUILD_INTERVAL = 0.1
+        self.mgr._RECONNECT_SETTLE_SEC = 0
         self.mgr._evt_stop.clear()
         t = threading.Thread(target=self.mgr._activation_event_loop, daemon=True)
         t.start()
