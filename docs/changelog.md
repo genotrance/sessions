@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-05-30
+
+### Fixed
+
+- **Profile restore tab duplication**: After a crash or hibernation, restoring a profile session duplicated tabs — Chrome's "didn't shut down correctly" prompt would re-open tabs that were already opened via the command line. Now uses `restore_on_startup: 4` with `startup_urls` in the profile's Preferences so Chrome opens all tabs directly without the crash prompt.
+- **Profile hibernate crash prompt**: Hibernating a profile session left the profile in a "crashed" exit state. On next restore, Chrome would show the "restore tabs?" infobar. Now sets `exit_type: Normal` before closing tabs so the next restore is clean.
+- **Profile restore after soft-hibernate**: Restoring a profile session that Chrome already had loaded (e.g. after auto-hibernate closed its window) failed with "Could not discover browserContextId" because the code only looked for new context IDs. Now also detects new targets in existing contexts and checks all contexts in the URL fallback. Additionally, when Chrome ignores the startup_urls prefs (because the profile is already loaded) and opens only a homepage, saved tabs are now opened via CDP as a fallback.
+- **False-positive backend exit after CDP reconnect**: After a CDP WebSocket disconnect, Chrome could report an incomplete target list on reconnect (e.g. 8 targets instead of 38). The watcher would then falsely conclude all session windows and the dashboard were closed, triggering a graceful exit while Chrome was still running. Both `_check_stale_hot` and `_check_dashboard_alive` now defer destructive actions for a 15-second grace period after any CDP reconnect.
+- **Watcher thread permanent death**: A race condition in `snapshot_all` could permanently kill the watcher thread. If `stop_watcher()`'s join timed out during a slow watcher tick, `start_watcher()` would see the old thread still alive and return early. When the old thread finished, no replacement was started — leaving the backend without stale detection, dashboard monitoring, or crash recovery for its entire lifetime. `start_watcher()` now detects this state and waits for the old thread to exit before starting a new one.
+
+### Improved
+
+- **Faster crash recovery**: Reduced the grace period from 3 iterations × (2s sleep + slow HTTP checks) to 2 iterations × (1s sleep + faster timeouts), cutting worst-case dead-Chrome detection from ~36s to ~10s.
+- **Crash diagnostics**: Added target count tracking (warns on sudden drops ≥10 and when count exceeds 80), per-context target type breakdown logging, Chrome process exit code logging during crash recovery, and resource pressure warnings to help diagnose Chrome crashes.
+- **Unhandled exception logging**: Installed `sys.excepthook` and `threading.excepthook` so uncaught exceptions in any thread are logged to the debug log, preventing silent process deaths with no diagnostic trace.
+- **Detach before dispose**: CDP sessions are now detached from a context's targets before calling `disposeBrowserContext`, preventing Chrome crashes caused by tearing down contexts with active CDP sessions still attached.
+- **Activity-based snapshot tiering**: Sessions idle for more than 5 minutes are snapshotted every 4th cycle instead of every cycle, reducing Chrome's CDP load by up to 75% for background sessions while keeping active sessions fully protected.
+- **Reduced WebSocket churn**: `snapshot_all` pre-fetches the target list once and shares it across all parallel snapshot workers, eliminating N redundant `getTargets` calls and WebSocket connections per cycle.
+
 ## [0.2.1] - 2026-05-28
 
 ### Fixed

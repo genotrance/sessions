@@ -139,6 +139,11 @@ class ProfileMixin:
                 db_tabs = [{"url": t["url"], "title": t.get("title", "")}
                            for t in tabs_to_save]
                 self.store.save_hibernation(cid, [], {}, db_tabs)
+                # Mark profile as cleanly exited so next restore does not
+                # trigger Chrome's "didn't shut down correctly" bar.
+                cdp.update_profile_prefs_for_restore(
+                    udd, cid,
+                    [t["url"] for t in tabs_to_save])
                 # Close all targets
                 for tid in ctx_tids:
                     try:
@@ -164,20 +169,39 @@ class ProfileMixin:
 
     def _discover_profile_context(self: ContainerManager,
                                   known_ctxs: set[str],
+                                  known_tids: set[str] | None = None,
                                   timeout: float = 30) -> str | None:
-        """Poll getTargets() to find a new browserContextId that wasn't in
-        *known_ctxs*.  Returns the new context ID, or None on timeout."""
+        """Poll getTargets() to find the browserContextId for a just-launched
+        profile.
+
+        First looks for a brand-new context ID (normal case when the profile
+        was not previously loaded).  If none appears, falls back to detecting
+        a *new target* (page) in an already-known context — this handles the
+        case where Chrome already had the profile loaded (e.g. after
+        soft-hibernate) and reuses the same context ID."""
         from .manager import SNAPSHOT_CDP_TIMEOUT
 
+        if known_tids is None:
+            known_tids = set()
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 with self._browser_session() as bs:
                     targets = bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT)
+                # Prefer a brand-new context (profile was freshly loaded)
                 for t in targets:
                     ctx = t.get("browserContextId")
                     if ctx and ctx not in known_ctxs and t.get("type") == "page":
                         return ctx
+                # Fallback: a new target appeared in an existing context
+                # (profile was already loaded, Chrome reused its context)
+                if known_tids:
+                    for t in targets:
+                        ctx = t.get("browserContextId")
+                        tid = t.get("targetId", "")
+                        if ctx and tid and tid not in known_tids \
+                                and t.get("type") == "page":
+                            return ctx
             except Exception:
                 pass
             time.sleep(0.3)
@@ -185,10 +209,22 @@ class ProfileMixin:
 
     def _restore_profile(self: ContainerManager, cid: str, row: dict,
                          also_open_url: str | None = None) -> dict:
-        """Restore a profile-backed session by launching its Chrome profile."""
+        """Restore a profile-backed session by launching its Chrome profile.
+
+        When *also_open_url* is ``None`` (crash recovery / hibernation
+        resume), the profile's ``Preferences`` are updated so Chrome opens
+        **all** previously-open tabs via ``restore_on_startup: 4`` +
+        ``startup_urls``.  This avoids the "Chrome didn't shut down
+        correctly" prompt and the duplicate-tab problem that occurs when a
+        single URL is passed on the command line alongside Chrome's own
+        session restore.
+
+        When *also_open_url* is given (user clicked a specific tab), only
+        that URL is passed to Chrome so it opens in a new tab.
+        """
         from .manager import SNAPSHOT_CDP_TIMEOUT
 
-        log.debug("_restore_profile: cid=%s", cid)
+        log.debug("_restore_profile: cid=%s also_open_url=%s", cid, also_open_url)
         chrome_mgr = self._chrome_mgr
         if not chrome_mgr:
             raise RuntimeError("No ChromeManager configured for profile sessions")
@@ -197,47 +233,60 @@ class ProfileMixin:
         # Ensure profile directory exists with session restore prefs
         cdp.create_profile_dir(chrome_mgr.user_data_dir, cid)
 
-        # Record known contexts before launch
+        # Record known contexts and target IDs before launch so we can
+        # detect new contexts (fresh profile load) or new targets in an
+        # existing context (profile already loaded, e.g. after soft-hibernate).
         known_ctxs: set[str] = set()
+        known_tids: set[str] = set()
         try:
             with self._browser_session() as bs:
                 for t in bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT):
                     ctx = t.get("browserContextId")
                     if ctx:
                         known_ctxs.add(ctx)
+                    tid = t.get("targetId")
+                    if tid:
+                        known_tids.add(tid)
         except Exception:
             pass
 
-        # Determine the start URL for Chrome:
-        # - If the caller specified a URL (tab click), use it.
-        # - Otherwise, use the first shadow tab URL so Chrome restores
-        #   it natively (avoids an extra about:blank tab).
         shadow_tabs = cdp.load_profile_tabs(chrome_mgr.user_data_dir, cid)
+
         if also_open_url:
-            start_url = also_open_url
-        elif shadow_tabs:
-            start_url = shadow_tabs[0]["url"]
+            # User clicked a specific tab — open just that URL.
+            chrome_mgr.launch_profile(prof_name, start_url=also_open_url)
         else:
-            start_url = "about:blank"
-        chrome_mgr.launch_profile(prof_name, start_url=start_url)
+            # Crash recovery or hibernation resume — open ALL saved tabs
+            # by writing them into the profile prefs so Chrome handles it
+            # natively, without a "restore tabs?" prompt or duplication.
+            restore_urls = [t["url"] for t in shadow_tabs] if shadow_tabs else []
+            if not restore_urls and row.get("tabs"):
+                restore_urls = [t["url"] for t in row["tabs"]
+                                if t.get("url") and t["url"] != "about:blank"]
+            cdp.update_profile_prefs_for_restore(
+                chrome_mgr.user_data_dir, cid, restore_urls)
+            chrome_mgr.launch_profile(prof_name, start_url=None)
 
         # Discover the new browserContextId
-        new_ctx = self._discover_profile_context(known_ctxs)
+        new_ctx = self._discover_profile_context(
+            known_ctxs, known_tids=known_tids)
         if not new_ctx:
             # Fallback: try to find a target in the profile by URL match
             log.warning("_restore_profile: could not discover context for %s, "
                         "falling back to tab list match", cid)
-            shadow_tabs = cdp.load_profile_tabs(chrome_mgr.user_data_dir, cid)
             saved_urls = {t["url"] for t in (row.get("tabs") or shadow_tabs)}
+            if also_open_url:
+                saved_urls.add(also_open_url)
             try:
                 with self._browser_session() as bs:
                     for t in bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT):
                         ctx = t.get("browserContextId")
-                        if ctx and ctx not in known_ctxs:
-                            url = t.get("url", "")
-                            if url in saved_urls or url == start_url:
-                                new_ctx = ctx
-                                break
+                        if not ctx or t.get("type") != "page":
+                            continue
+                        url = t.get("url", "")
+                        if url in saved_urls:
+                            new_ctx = ctx
+                            break
             except Exception:
                 pass
         if not new_ctx:
@@ -249,7 +298,14 @@ class ProfileMixin:
         self.store.mark_active(cid, True)
         self.store.touch_accessed(cid)
 
-        # Wait for Chrome to register the tab in the context.
+        # Reset prefs back to restore_on_startup=1 so that future Chrome
+        # restarts (by the user or after a crash) use native session restore
+        # rather than the one-time startup_urls list.
+        if not also_open_url:
+            cdp.reset_profile_prefs_after_launch(
+                chrome_mgr.user_data_dir, cid)
+
+        # Wait for Chrome to register tabs in the context.
         time.sleep(1.5)
         try:
             profile_tabs = self._targets_for(new_ctx)
@@ -257,24 +313,39 @@ class ProfileMixin:
         except Exception:
             live_urls = set()
 
-        # Only open shadow tabs if Chrome didn't launch any real tabs AND
-        # we didn't already pass a real URL as start_url (which Chrome is
-        # loading — it just may not have appeared in targets yet).
-        need_shadow = (not live_urls - {"about:blank", ""}
-                       and start_url in ("about:blank", ""))
-        if need_shadow and shadow_tabs:
-            log.debug("_restore_profile: Chrome did not restore tabs, "
-                      "opening %d from shadow list", len(shadow_tabs))
-            with self._browser_session() as bs:
-                for tab in shadow_tabs:
-                    try:
-                        bs.target.create_target(
-                            url=tab["url"], browser_context_id=new_ctx)
-                    except Exception:
-                        pass
+        # Build the set of URLs we expected Chrome to restore.
+        expected_urls: set[str] = set()
+        tabs_source = shadow_tabs or row.get("tabs") or []
+        for t in tabs_source:
+            u = t.get("url", "")
+            if u and u != "about:blank":
+                expected_urls.add(u)
 
-        tabs_count = max(len(live_urls - {"about:blank", ""}),
-                         len(shadow_tabs))
+        # Fallback: open saved tabs via CDP if Chrome did not restore them.
+        # This triggers when:
+        #  - Chrome opened zero real tabs (brand-new profile, corrupt prefs)
+        #  - Chrome only opened a homepage instead of saved tabs (profile
+        #    was already loaded — "Opening in existing browser session" —
+        #    and ignored the startup_urls prefs).
+        real_urls = {u for u in live_urls
+                     if u and u != "about:blank"
+                     and not u.startswith("chrome://")}
+        tabs_restored = bool(expected_urls & real_urls)
+        if not tabs_restored and not also_open_url and expected_urls:
+            log.debug("_restore_profile: Chrome did not restore tabs "
+                      "(live=%d, expected=%d), opening via CDP",
+                      len(real_urls), len(expected_urls))
+            with self._browser_session() as bs:
+                for t in tabs_source:
+                    url = t.get("url", "")
+                    if url and url != "about:blank":
+                        try:
+                            bs.target.create_target(
+                                url=url, browser_context_id=new_ctx)
+                        except Exception:
+                            pass
+
+        tabs_count = max(len(real_urls), len(expected_urls))
         log.debug("_restore_profile: done cid=%s ctx=%s tabs=%d",
                   cid, new_ctx, tabs_count)
         return {"id": cid, "browserContextId": new_ctx,

@@ -547,5 +547,282 @@ class TestProfileEdgeCases(_PatchedManagerMixin, unittest.TestCase):
         self.assertFalse(os.path.isdir(prof_path))
 
 
+# ---------------------------------------------------------------------------
+# Prefs-based restore (tab duplication fix)
+# ---------------------------------------------------------------------------
+
+class TestPrefsBasedRestore(_PatchedManagerMixin, unittest.TestCase):
+
+    def _setup_for_restore(self, shadow_urls):
+        """Create a profile container with shadow tabs saved, return cid."""
+        self.mgr._chrome_mgr = type("CM", (), {
+            "user_data_dir": self.tmp,
+            "chrome_path": "chrome",
+        })()
+        # Stub launch_profile so it doesn't actually launch Chrome
+        launched = []
+        def fake_launch(prof, start_url="about:blank"):
+            launched.append({"prof": prof, "start_url": start_url})
+            # Simulate Chrome creating a target in a new context
+            new_ctx = f"CTX-RESTORE-{len(launched)}"
+            for url in shadow_urls:
+                self.fb.seed_tab(new_ctx, url, "")
+        self.mgr._chrome_mgr.launch_profile = fake_launch
+
+        c = self.mgr.create_container("Restore", session_type="profile")
+        cid = c["id"]
+        tabs = [{"url": u, "title": ""} for u in shadow_urls]
+        cdp.save_profile_tabs(self.tmp, cid, tabs)
+        self.store.save_hibernation(cid, [], {}, tabs)
+        return cid, launched
+
+    def test_restore_no_url_uses_prefs(self):
+        """Restore without also_open_url writes prefs and passes start_url=None."""
+        urls = ["https://gmail.com/inbox", "https://docs.google.com"]
+        cid, launched = self._setup_for_restore(urls)
+
+        self.mgr.restore(cid)
+
+        # launch_profile should have been called with start_url=None
+        self.assertEqual(len(launched), 1)
+        self.assertIsNone(launched[0]["start_url"])
+
+        # Prefs should have been updated with startup_urls before launch
+        import json
+        prefs_path = os.path.join(
+            self.tmp, cdp.profile_dir_name(cid), "Preferences")
+        with open(prefs_path) as f:
+            prefs = json.load(f)
+        # After restore, prefs are reset back to restore_on_startup=1
+        self.assertEqual(prefs["session"]["restore_on_startup"], 1)
+
+    def test_restore_with_url_passes_it_directly(self):
+        """Restore with also_open_url passes it as start_url (no prefs change)."""
+        urls = ["https://gmail.com/inbox"]
+        cid, launched = self._setup_for_restore(urls)
+
+        self.mgr.restore(cid, also_open_url="https://gmail.com/inbox")
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0]["start_url"], "https://gmail.com/inbox")
+
+    def test_restore_prefs_reset_after_launch(self):
+        """After prefs-based restore, prefs are reset to restore_on_startup=1."""
+        urls = ["https://example.com"]
+        cid, launched = self._setup_for_restore(urls)
+
+        self.mgr.restore(cid)
+
+        import json
+        prefs_path = os.path.join(
+            self.tmp, cdp.profile_dir_name(cid), "Preferences")
+        with open(prefs_path) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["session"]["restore_on_startup"], 1)
+        self.assertNotIn("startup_urls", prefs.get("session", {}))
+
+    def test_restore_prefs_clean_exit(self):
+        """Prefs-based restore sets exit_type=Normal and exited_cleanly=True."""
+        urls = ["https://example.com"]
+        cid, _launched = self._setup_for_restore(urls)
+
+        # Read prefs BEFORE restore completes (intercept launch_profile)
+        prefs_before_launch = {}
+        orig_launch = self.mgr._chrome_mgr.launch_profile
+        def capture_launch(prof, start_url="about:blank"):
+            import json
+            prefs_path = os.path.join(
+                self.tmp, cdp.profile_dir_name(cid), "Preferences")
+            with open(prefs_path) as f:
+                prefs_before_launch.update(json.load(f))
+            orig_launch(prof, start_url=start_url)
+        self.mgr._chrome_mgr.launch_profile = capture_launch
+
+        self.mgr.restore(cid)
+
+        self.assertEqual(prefs_before_launch["profile"]["exit_type"], "Normal")
+        self.assertTrue(prefs_before_launch["profile"]["exited_cleanly"])
+        self.assertEqual(prefs_before_launch["session"]["restore_on_startup"], 4)
+        self.assertEqual(prefs_before_launch["session"]["startup_urls"],
+                         ["https://example.com"])
+
+    def test_hibernate_sets_clean_exit_prefs(self):
+        """Hibernating a profile writes exit_type=Normal so next restore is clean."""
+        self.mgr._chrome_mgr = type("CM", (), {"user_data_dir": self.tmp})()
+        c = self.mgr.create_container("Hib", session_type="profile")
+        cid = c["id"]
+        ctx = "CTX-HIB"
+        self.mgr.hot[cid] = ctx
+        self.mgr._profile_sessions.add(cid)
+        self.store.mark_active(cid, True)
+        self.fb.seed_tab(ctx, "https://example.com", "Ex")
+
+        self.mgr.hibernate(cid)
+
+        import json
+        prefs_path = os.path.join(
+            self.tmp, cdp.profile_dir_name(cid), "Preferences")
+        with open(prefs_path) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["profile"]["exit_type"], "Normal")
+        self.assertTrue(prefs["profile"]["exited_cleanly"])
+        self.assertEqual(prefs["session"]["restore_on_startup"], 4)
+        self.assertIn("https://example.com", prefs["session"]["startup_urls"])
+
+
+# ---------------------------------------------------------------------------
+# cdp helper tests
+# ---------------------------------------------------------------------------
+
+class TestProfilePrefsHelpers(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ctxd-prefs-")
+        # Create a minimal profile dir
+        cid = "test-prefs"
+        self.cid = cid
+        self.prof_path = os.path.join(self.tmp, cdp.profile_dir_name(cid))
+        os.makedirs(self.prof_path, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_update_prefs_with_urls(self):
+        """update_profile_prefs_for_restore writes startup_urls and clean exit."""
+        import json
+        cdp.update_profile_prefs_for_restore(
+            self.tmp, self.cid, ["https://a.com", "https://b.com"])
+        with open(os.path.join(self.prof_path, "Preferences")) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["session"]["restore_on_startup"], 4)
+        self.assertEqual(prefs["session"]["startup_urls"],
+                         ["https://a.com", "https://b.com"])
+        self.assertEqual(prefs["profile"]["exit_type"], "Normal")
+        self.assertTrue(prefs["profile"]["exited_cleanly"])
+
+    def test_update_prefs_no_urls(self):
+        """update_profile_prefs_for_restore with no URLs falls back to restore_on_startup=1."""
+        import json
+        cdp.update_profile_prefs_for_restore(self.tmp, self.cid, [])
+        with open(os.path.join(self.prof_path, "Preferences")) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["session"]["restore_on_startup"], 1)
+
+    def test_reset_prefs(self):
+        """reset_profile_prefs_after_launch restores restore_on_startup=1."""
+        import json
+        cdp.update_profile_prefs_for_restore(
+            self.tmp, self.cid, ["https://a.com"])
+        cdp.reset_profile_prefs_after_launch(self.tmp, self.cid)
+        with open(os.path.join(self.prof_path, "Preferences")) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["session"]["restore_on_startup"], 1)
+        self.assertNotIn("startup_urls", prefs["session"])
+
+    def test_update_prefs_preserves_existing(self):
+        """update_profile_prefs_for_restore preserves other prefs keys."""
+        import json
+        prefs_path = os.path.join(self.prof_path, "Preferences")
+        with open(prefs_path, "w") as f:
+            json.dump({"custom_key": "value", "profile": {"name": "Test"}}, f)
+        cdp.update_profile_prefs_for_restore(
+            self.tmp, self.cid, ["https://a.com"])
+        with open(prefs_path) as f:
+            prefs = json.load(f)
+        self.assertEqual(prefs["custom_key"], "value")
+        self.assertEqual(prefs["profile"]["name"], "Test")
+        self.assertEqual(prefs["profile"]["exit_type"], "Normal")
+
+
+# ---------------------------------------------------------------------------
+# FIX: Profile restore when profile is already loaded in Chrome
+# (context reuse after soft-hibernate)
+# ---------------------------------------------------------------------------
+
+class TestProfileRestoreAlreadyLoaded(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: restoring a profile that Chrome already has loaded must succeed
+    by detecting a new target in the existing context, not only new contexts."""
+
+    def _setup_already_loaded(self, urls, homepage_url="https://www.google.com/"):
+        """Create a profile session with Chrome already having the context loaded.
+
+        Simulates the scenario where _soft_hibernate closed the tabs but the
+        profile context still exists in Chrome (as happens with Chrome profiles).
+        *homepage_url* is what Chrome opens instead of the saved tabs.
+        """
+        self.mgr._chrome_mgr = type("CM", (), {
+            "user_data_dir": self.tmp,
+            "chrome_path": "chrome",
+        })()
+
+        c = self.mgr.create_container("Already", session_type="profile")
+        cid = c["id"]
+        tabs = [{"url": u, "title": ""} for u in urls]
+        cdp.save_profile_tabs(self.tmp, cid, tabs)
+        self.store.save_hibernation(cid, [], {}, tabs)
+
+        # Seed an existing context for this profile (simulating Chrome
+        # having the profile loaded but window closed / tabs cleared).
+        existing_ctx = "CTX-ALREADY-LOADED"
+        # The context has no page targets (tabs were closed by _soft_hibernate)
+
+        launched = []
+        def fake_launch(prof, start_url="about:blank"):
+            launched.append({"prof": prof, "start_url": start_url})
+            # Chrome reuses the EXISTING context (no new context created),
+            # but opens a new tab (new target ID) with the homepage.
+            self.fb.seed_tab(existing_ctx, homepage_url, "Homepage")
+
+        self.mgr._chrome_mgr.launch_profile = fake_launch
+        return cid, launched, existing_ctx
+
+    def test_restore_reuses_existing_context(self):
+        """Profile restore must detect the existing context via new target ID."""
+        urls = ["https://gmail.com/inbox"]
+        cid, launched, existing_ctx = self._setup_already_loaded(urls)
+
+        result = self.mgr.restore(cid)
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(result["id"], cid)
+        self.assertIn(cid, self.mgr.hot)
+        # The context should be the existing one, not a brand new one
+        self.assertEqual(self.mgr.hot[cid], existing_ctx)
+        # Session should be marked active
+        row = self.store.get_container(cid)
+        self.assertTrue(row["is_active"])
+
+    def test_restore_opens_saved_tabs_via_cdp_when_homepage_only(self):
+        """When Chrome opens only a homepage (not saved tabs), saved tabs
+        must be opened via CDP create_target."""
+        urls = ["https://gmail.com/inbox", "https://docs.google.com"]
+        cid, launched, existing_ctx = self._setup_already_loaded(urls)
+
+        self.mgr.restore(cid)
+
+        # The saved tabs should have been opened via CDP (create_target)
+        ctx_targets = [t for t in self.fb.targets.values()
+                       if t["browserContextId"] == existing_ctx]
+        ctx_urls = {t["url"] for t in ctx_targets}
+        for url in urls:
+            self.assertIn(url, ctx_urls,
+                          f"Saved tab {url} not opened via CDP")
+
+    def test_discover_profile_context_accepts_known_tids(self):
+        """_discover_profile_context must accept known_tids parameter."""
+        import inspect
+        sig = inspect.signature(ContainerManager._discover_profile_context)
+        self.assertIn("known_tids", sig.parameters)
+
+    def test_url_fallback_checks_all_contexts(self):
+        """URL fallback in _restore_profile must check ALL contexts, not just new."""
+        import inspect
+        src = inspect.getsource(ContainerManager._restore_profile)
+        # The fallback should NOT filter by "ctx not in known_ctxs"
+        # (old bug: it only checked new contexts, missing already-loaded profiles)
+        self.assertNotIn("ctx not in known_ctxs", src)
+
+
 if __name__ == "__main__":
     unittest.main()

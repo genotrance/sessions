@@ -1087,5 +1087,225 @@ class TestEventLoopReconnectBackoff(unittest.TestCase):
         self.assertIn("time.sleep", src)
 
 
+# ---------------------------------------------------------------------------
+# FIX: _dispose_context detaches CDP sessions before disposing to prevent
+# Chrome crashes when the context is torn down with sessions still attached.
+# ---------------------------------------------------------------------------
+
+class TestDetachBeforeDispose(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: disposeBrowserContext must go through _dispose_context."""
+
+    def test_soft_hibernate_uses_dispose_context(self):
+        """_soft_hibernate must call _dispose_context instead of raw dispose."""
+        import inspect
+        src = inspect.getsource(ContainerManager._soft_hibernate)
+        self.assertIn("_dispose_context", src)
+        self.assertNotIn("dispose_browser_context", src)
+
+    def test_hibernate_uses_dispose_context(self):
+        """hibernate must call _dispose_context instead of raw dispose."""
+        import inspect
+        src = inspect.getsource(ContainerManager.hibernate)
+        self.assertIn("_dispose_context", src)
+        self.assertNotIn("dispose_browser_context", src)
+
+    def test_delete_uses_dispose_context(self):
+        """delete must call _dispose_context instead of raw dispose."""
+        import inspect
+        src = inspect.getsource(ContainerManager.delete)
+        self.assertIn("_dispose_context", src)
+        self.assertNotIn("dispose_browser_context", src)
+
+    def test_dispose_context_sets_disposing_flag(self):
+        """_dispose_context must add ctx to _disposing_ctxs during dispose."""
+        row = self.mgr.create_container("test")
+        cid = row["id"]
+        result = self.mgr.restore(cid)
+        ctx = result["browserContextId"]
+        # Track whether _disposing_ctxs was populated during dispose
+        seen_disposing = []
+        bs = self.mgr._new_browser_session().__enter__()
+        original_dispose = bs.target.dispose_browser_context
+        def tracking_dispose(context_id):
+            seen_disposing.append(ctx in self.mgr._disposing_ctxs)
+            return original_dispose(context_id)
+        bs.target.dispose_browser_context = tracking_dispose
+        self.mgr._dispose_context(bs, ctx, "test")
+        self.assertTrue(any(seen_disposing),
+                        "_disposing_ctxs should contain ctx during dispose")
+
+    def test_dispose_context_clears_flag_after(self):
+        """_dispose_context must remove ctx from _disposing_ctxs after dispose."""
+        row = self.mgr.create_container("test")
+        cid = row["id"]
+        result = self.mgr.restore(cid)
+        ctx = result["browserContextId"]
+        self.mgr._dispose_context(
+            self.mgr._new_browser_session().__enter__(), ctx, "test")
+        self.assertNotIn(ctx, self.mgr._disposing_ctxs)
+
+    def test_detach_cleans_tab_last_activated(self):
+        """_detach_context_sessions must clean up _tab_last_activated entries."""
+        row = self.mgr.create_container("test")
+        cid = row["id"]
+        result = self.mgr.restore(cid)
+        ctx = result["browserContextId"]
+        tid = self.mgr.open_tab(cid, "https://example.com")
+        self.mgr._tab_last_activated[tid] = 1234567890.0
+        bs = self.mgr._new_browser_session().__enter__()
+        self.mgr._detach_context_sessions(ctx, bs)
+        self.assertNotIn(tid, self.mgr._tab_last_activated)
+
+
+# ---------------------------------------------------------------------------
+# FIX: Activity-based tiered snapshotting reduces Chrome load by only
+# snapshotting idle sessions every Nth cycle.
+# ---------------------------------------------------------------------------
+
+class TestTieredSnapshotting(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: snapshot_all must skip idle sessions on non-Nth cycles."""
+
+    def _setup_sessions(self):
+        """Create two sessions: one active, one idle."""
+        import time
+        row_active = self.mgr.create_container("active")
+        row_idle = self.mgr.create_container("idle")
+        self.mgr.restore(row_active["id"])
+        self.mgr.restore(row_idle["id"])
+        # Open tabs so snapshots have something to save
+        self.mgr.open_tab(row_active["id"], "https://active.com")
+        self.mgr.open_tab(row_idle["id"], "https://idle.com")
+        # Mark idle session as last active 10 minutes ago
+        self.mgr._session_last_active[row_idle["id"]] = (
+            time.time() - self.mgr._IDLE_THRESHOLD_SEC - 60)
+        # Mark active session as just used
+        self.mgr._session_last_active[row_active["id"]] = time.time()
+        return row_active["id"], row_idle["id"]
+
+    def test_idle_skipped_on_non_nth_cycle(self):
+        """Idle sessions should be skipped on cycles that aren't multiples of N."""
+        active_cid, idle_cid = self._setup_sessions()
+        # Reset cycle counter to a non-multiple
+        self.mgr._snapshot_cycle = 0
+        results = self.mgr.snapshot_all()
+        # Active session should be snapshotted
+        result_cids = [r.get("id") for r in results if "id" in r]
+        self.assertIn(active_cid, result_cids)
+        self.assertNotIn(idle_cid, result_cids)
+
+    def test_idle_included_on_nth_cycle(self):
+        """Idle sessions should be included on every Nth cycle."""
+        active_cid, idle_cid = self._setup_sessions()
+        # Set cycle so next increment is a multiple of _IDLE_SNAPSHOT_MULTIPLE
+        self.mgr._snapshot_cycle = self.mgr._IDLE_SNAPSHOT_MULTIPLE - 1
+        results = self.mgr.snapshot_all()
+        result_cids = [r.get("id") for r in results if "id" in r]
+        self.assertIn(active_cid, result_cids)
+        self.assertIn(idle_cid, result_cids)
+
+    def test_newly_restored_session_is_active(self):
+        """Freshly restored sessions should be treated as active."""
+        row = self.mgr.create_container("new")
+        cid = row["id"]
+        self.mgr.restore(cid)
+        self.assertIn(cid, self.mgr._session_last_active)
+
+    def test_snapshot_cycle_increments(self):
+        """snapshot_all must increment the cycle counter each call."""
+        self.mgr.create_container("x")
+        before = self.mgr._snapshot_cycle
+        self.mgr.snapshot_all()
+        self.assertEqual(self.mgr._snapshot_cycle, before + 1)
+
+    def test_constants_exist(self):
+        """Tiering constants must be defined on the class."""
+        self.assertIsInstance(ContainerManager._IDLE_THRESHOLD_SEC, (int, float))
+        self.assertIsInstance(ContainerManager._IDLE_SNAPSHOT_MULTIPLE, int)
+        self.assertGreater(ContainerManager._IDLE_SNAPSHOT_MULTIPLE, 1)
+
+
+# ---------------------------------------------------------------------------
+# FIX: snapshot_all pre-fetches targets once to reduce WebSocket churn.
+# ---------------------------------------------------------------------------
+
+class TestPrefetchedTargets(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: snapshot_all must pre-fetch targets and pass them through."""
+
+    def test_snapshot_all_prefetches(self):
+        """snapshot_all must pre-fetch targets before parallel snapshots."""
+        import inspect
+        src = inspect.getsource(ContainerManager.snapshot_all)
+        self.assertIn("shared_targets", src)
+        self.assertIn("prefetched_targets", src)
+
+    def test_collect_state_accepts_prefetched(self):
+        """_collect_state must accept a prefetched_targets parameter."""
+        import inspect
+        sig = inspect.signature(ContainerManager._collect_state)
+        self.assertIn("prefetched_targets", sig.parameters)
+
+    def test_snapshot_accepts_prefetched(self):
+        """snapshot must accept and forward prefetched_targets."""
+        import inspect
+        sig = inspect.signature(ContainerManager.snapshot)
+        self.assertIn("prefetched_targets", sig.parameters)
+
+    def test_prefetched_targets_used_when_provided(self):
+        """_collect_state should use provided targets instead of fetching."""
+        row = self.mgr.create_container("test")
+        cid = row["id"]
+        self.mgr.restore(cid)
+        self.mgr.open_tab(cid, "https://example.com")
+        ctx = self.mgr.hot[cid]
+        # Provide a pre-fetched targets list
+        targets = list(self.fb.targets.values())
+        result = self.mgr._collect_state(ctx, prefetched_targets=targets)
+        cookies, storage, idb, tabs = result
+        self.assertGreaterEqual(len(tabs), 1)
+
+
+# ---------------------------------------------------------------------------
+# FIX: _check_stale_hot logs per-context target breakdown when target count
+# is high or drops significantly.
+# ---------------------------------------------------------------------------
+
+class TestPerContextBreakdownLogging(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: target breakdown diagnostic logging exists in _check_stale_hot."""
+
+    def test_breakdown_code_exists(self):
+        """_check_stale_hot must contain per-context breakdown logic."""
+        import inspect
+        src = inspect.getsource(ContainerManager._check_stale_hot)
+        self.assertIn("ctx_counts", src)
+        self.assertIn("target breakdown", src)
+
+
+# ---------------------------------------------------------------------------
+# FIX: Event loop skips attaching targets from contexts being disposed.
+# ---------------------------------------------------------------------------
+
+class TestEventLoopDisposingCtxs(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: activation event loop must respect _disposing_ctxs."""
+
+    def test_rebuild_checks_disposing(self):
+        """_rebuild in the event loop must skip targets from disposing contexts."""
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        self.assertIn("_disposing_ctxs", src)
+
+    def test_poll_evicts_disposing(self):
+        """_poll must detach targets from contexts being disposed."""
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        # The poll section should check disposing contexts
+        self.assertIn("disposing", src)
+
+    def test_session_last_active_updated_on_focus(self):
+        """Focus events must update _session_last_active."""
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        self.assertIn("_session_last_active", src)
+
+
 if __name__ == "__main__":
     unittest.main()

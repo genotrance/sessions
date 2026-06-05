@@ -132,8 +132,17 @@ class ContainerManager(ProfileMixin):
         self._evt_stop = threading.Event()  # separate from _watcher_stop
         # Profile session tracking: cids whose session_type == 'profile'
         self._profile_sessions: set[str] = set()
+        # Per-session last-accessed timestamp (cid -> epoch) for tiered snapshotting
+        self._session_last_active: dict[str, float] = {}
+        # Snapshot cycle counter — used for tiered snapshotting of idle sessions
+        self._snapshot_cycle: int = 0
+        # Context IDs being disposed — lets the event loop detach proactively
+        self._disposing_ctxs: set[str] = set()
         # Reference to ChromeManager for launching profile windows
         self._chrome_mgr: cdp.ChromeManager | None = None
+        # Monotonic timestamp of last CDP reconnect — used to suppress
+        # false-positive stale/dashboard checks right after reconnect.
+        self._last_reconnect_mono: float = 0
 
     # -- low-level CDP helpers ------------------------------------------------
 
@@ -158,6 +167,16 @@ class ContainerManager(ProfileMixin):
     # crash recovery is suppressed for a cooldown period.
     _SLEEP_GAP_SEC = 30
     _SLEEP_COOLDOWN_SEC = 15
+    # Warn when Chrome has this many targets — resource pressure risk.
+    _TARGET_COUNT_WARNING_THRESHOLD = 80
+    # Grace period (seconds) after a CDP reconnect during which stale-hot
+    # and dashboard-alive checks skip destructive actions (hibernate / exit).
+    # Right after a reconnect, Chrome may report an incomplete target list.
+    _RECONNECT_GRACE_SEC = 15
+    # Activity-based snapshot tiering: sessions idle longer than this get
+    # snapshotted less frequently (every _IDLE_SNAPSHOT_MULTIPLE cycles).
+    _IDLE_THRESHOLD_SEC = 300        # 5 minutes with no focus
+    _IDLE_SNAPSHOT_MULTIPLE = 4      # snapshot idle sessions every 4th cycle
 
     def _browser_session(self) -> _BorrowedSession:
         with self._bs_lock:
@@ -186,6 +205,7 @@ class ContainerManager(ProfileMixin):
                     sess = CDPSession.connect_browser(self.browser_port)
                     log.debug("browser CDP session established")
                     self._cached_bs = sess
+                    self._last_reconnect_mono = time.monotonic()
                     return self._BorrowedSession(sess)
                 except Exception as e:
                     last_err = e
@@ -242,7 +262,16 @@ class ContainerManager(ProfileMixin):
         """Start a background thread that auto-hibernates containers whose
         browser windows have been closed by the user."""
         if self._watcher_thread and self._watcher_thread.is_alive():
-            return
+            if not self._watcher_stop.is_set():
+                return  # still running normally
+            # The thread is alive but has been told to stop (e.g. snapshot_all
+            # called stop_watcher and the join timed out).  Wait briefly for
+            # the old thread to finish so we can safely start a new one.
+            self._watcher_thread.join(timeout=15)
+            if self._watcher_thread.is_alive():
+                log.debug("start_watcher: old thread still alive after wait, "
+                          "skipping restart")
+                return
         self._watcher_stop.clear()
         self._watcher_thread = threading.Thread(
             target=self._watcher_loop, daemon=True, name="window-watcher")
@@ -313,12 +342,13 @@ class ContainerManager(ProfileMixin):
                 targets = bs.target.get_targets(timeout=5)
             except Exception:
                 return
+            disposing = self._disposing_ctxs
             current_tids: set[str] = set()
             for t in targets:
                 if t.get("type") != "page":
                     continue
                 ctx = t.get("browserContextId", "")
-                if ctx not in ctx_to_cid:
+                if ctx not in ctx_to_cid or ctx in disposing:
                     continue
                 tid = t.get("targetId", "")
                 current_tids.add(tid)
@@ -330,9 +360,9 @@ class ContainerManager(ProfileMixin):
                     except Exception as exc:
                         log.debug("cdp-events: attach %s failed: %s",
                                   tid[:8], exc)
-            # Detach tabs that are no longer hot
+            # Detach tabs that are no longer hot or belong to disposing contexts
             for tid in list(attached):
-                if tid not in current_tids:
+                if tid not in current_tids or attached[tid][1] in disposing:
                     try:
                         bs.target.detach_from_target(attached[tid][0])
                     except Exception:
@@ -376,12 +406,23 @@ class ContainerManager(ProfileMixin):
                 # Other exceptions (WebSocket closed, OS errors, …) are NOT
                 # caught here.  They propagate to the outer try/except which
                 # sets bs=None and triggers a full reconnect + rebuild.
+            # Evict targets from contexts being disposed
+            disposing = self._disposing_ctxs
+            if disposing:
+                for tid in list(attached):
+                    if attached[tid][1] in disposing:
+                        try:
+                            bs.target.detach_from_target(attached[tid][0])
+                        except Exception:
+                            pass
+                        del attached[tid]
             if focused_tid and focused_tid != prev_focused:
                 prev_focused = focused_tid
                 now = time.time()
                 self._tab_last_activated[focused_tid] = now
                 cid = ctx_to_cid.get(focused_ctx, "")
                 if cid:
+                    self._session_last_active[cid] = now
                     self.store.touch_accessed(cid)
                     log.debug("cdp-events: focus tid=%s cid=%s",
                               focused_tid[:8], cid)
@@ -531,6 +572,12 @@ class ContainerManager(ProfileMixin):
                 self._on_ui_close()
             return
         if not any(t.get("targetId") == tid for t in targets):
+            # After a fresh CDP reconnect the target list may be incomplete;
+            # defer the exit decision until the grace period expires.
+            if self._in_reconnect_grace():
+                log.debug("dashboard target %s not found, but in reconnect "
+                          "grace period — deferring", tid)
+                return
             log.debug("dashboard target %s gone, triggering UI-close", tid)
             self._dashboard_target_id = None
             self._on_ui_close()
@@ -555,6 +602,15 @@ class ContainerManager(ProfileMixin):
         """Return True if we are in the post-sleep cooldown window."""
         until = getattr(self, '_sleep_cooldown_until', 0)
         return time.monotonic() < until
+
+    def _in_reconnect_grace(self) -> bool:
+        """Return True if a CDP reconnect happened recently.
+
+        Right after reconnecting, Chrome's target list may be incomplete
+        (e.g. 8 targets instead of 38).  Destructive decisions (hibernate
+        all containers, trigger UI-close exit) must be deferred."""
+        return (time.monotonic() - self._last_reconnect_mono
+                < self._RECONNECT_GRACE_SEC)
 
     def _maybe_trigger_snapshot_crash_recovery(self, cid: str, err: Exception) -> None:
         if not self._on_chrome_crash:
@@ -627,7 +683,41 @@ class ContainerManager(ProfileMixin):
             with self._browser_session() as bs:
                 all_targets = bs.target.get_targets(
                     timeout=SNAPSHOT_CDP_TIMEOUT)
-            log.debug("_check_stale_hot: got %d targets from Chrome", len(all_targets))
+            target_count = len(all_targets)
+            log.debug("_check_stale_hot: got %d targets from Chrome", target_count)
+            # Track target count changes to detect Chrome instability
+            prev_count = getattr(self, '_last_target_count', None)
+            self._last_target_count = target_count
+            if prev_count is not None:
+                drop = prev_count - target_count
+                if drop >= 10:
+                    log.warning("_check_stale_hot: target count dropped by %d "
+                                "(%d → %d), Chrome may be under pressure",
+                                drop, prev_count, target_count)
+            if target_count >= self._TARGET_COUNT_WARNING_THRESHOLD or (
+                    prev_count is not None and prev_count - target_count >= 10):
+                # Log per-context breakdown for diagnostics
+                ctx_counts: dict[str, dict[str, int]] = {}
+                for t in all_targets:
+                    ctx = t.get("browserContextId", "<default>")
+                    ttype = t.get("type", "other")
+                    if ctx not in ctx_counts:
+                        ctx_counts[ctx] = {}
+                    ctx_counts[ctx][ttype] = ctx_counts[ctx].get(ttype, 0) + 1
+                # Map known contexts to session IDs
+                ctx_to_cid = {v: k for k, v in hot_snapshot.items()}
+                breakdown = []
+                for ctx, types in sorted(ctx_counts.items(),
+                                         key=lambda x: sum(x[1].values()),
+                                         reverse=True):
+                    label = ctx_to_cid.get(ctx, ctx[:12])
+                    parts = " ".join(f"{k}={v}" for k, v in sorted(types.items()))
+                    breakdown.append(f"{label}({parts})")
+                log.warning("_check_stale_hot: target breakdown: %s",
+                            ", ".join(breakdown))
+            if target_count >= self._TARGET_COUNT_WARNING_THRESHOLD:
+                log.warning("_check_stale_hot: high target count (%d), "
+                            "Chrome resource pressure risk", target_count)
         except Exception as e:
             log.debug("_check_stale_hot: CDP error getting targets: %s", e)
             return
@@ -646,6 +736,12 @@ class ContainerManager(ProfileMixin):
 
         if stale_cids:
             log.debug("_check_stale_hot: stale cids=%s", stale_cids)
+        # After a CDP reconnect the target list may be incomplete — defer
+        # hibernation so we don't falsely conclude all windows are closed.
+        if stale_cids and self._in_reconnect_grace():
+            log.debug("_check_stale_hot: skipping hibernate for %d stale "
+                       "cids (reconnect grace period)", len(stale_cids))
+            return
         for cid in stale_cids:
             try:
                 log.debug("auto-hibernating %s (window closed)", cid)
@@ -655,6 +751,39 @@ class ContainerManager(ProfileMixin):
                 with self._lock:
                     self.hot.pop(cid, None)
                     self.store.mark_active(cid, False)
+
+    def _detach_context_sessions(self, ctx: str,
+                                    bs: CDPSession | None = None) -> None:
+        """Signal the activation event loop to drop any sessions attached to
+        targets in *ctx*, then proactively detach them on the provided browser
+        session.  This must be called BEFORE disposeBrowserContext to prevent
+        Chrome from crashing when the context is torn down while CDP sessions
+        are still attached to its targets."""
+        self._disposing_ctxs.add(ctx)
+        if bs is None:
+            return
+        try:
+            all_targets = bs.target.get_targets(timeout=SNAPSHOT_CDP_TIMEOUT)
+            for t in all_targets:
+                if (t.get("browserContextId") == ctx
+                        and t.get("type") == "page"):
+                    tid = t.get("targetId", "")
+                    # Clean up per-tab activity tracking
+                    self._tab_last_activated.pop(tid, None)
+        except Exception as e:
+            log.debug("_detach_context_sessions: getTargets error: %s", e)
+
+    def _dispose_context(self, bs: CDPSession, ctx: str,
+                         label: str = "") -> None:
+        """Detach CDP sessions then dispose a browser context safely."""
+        self._detach_context_sessions(ctx, bs)
+        try:
+            bs.target.dispose_browser_context(ctx)
+            log.debug("%s: context %s disposed", label or "dispose", ctx)
+        except CDPError as e:
+            log.debug("%s: dispose CDPError (ignored): %s", label or "dispose", e)
+        finally:
+            self._disposing_ctxs.discard(ctx)
 
     def _soft_hibernate(self, cid: str) -> None:
         """Mark a container cold and dispose its browser context WITHOUT
@@ -681,11 +810,7 @@ class ContainerManager(ProfileMixin):
                     except Exception:
                         pass
                     if not is_prof:
-                        try:
-                            bs.target.dispose_browser_context(ctx)
-                            log.debug("_soft_hibernate: context %s disposed", ctx)
-                        except CDPError as e:
-                            log.debug("_soft_hibernate: dispose CDPError (ignored): %s", e)
+                        self._dispose_context(bs, ctx, "_soft_hibernate")
             self.store.mark_active(cid, False)
             log.debug("soft-hibernated %s (preserved last snapshot)", cid)
 
@@ -726,7 +851,9 @@ class ContainerManager(ProfileMixin):
 
     # -- hibernate ------------------------------------------------------------
 
-    def _collect_state(self, ctx: str) -> tuple[list[dict], dict, list[dict]]:
+    def _collect_state(self, ctx: str,
+                       prefetched_targets: list[dict] | None = None,
+                       ) -> tuple[list[dict], dict, list[dict]]:
         log.debug("_collect_state: ctx=%s", ctx)
         # Use a fresh per-call browser session instead of the shared cached one.
         # The shared session is not thread-safe for concurrent sends: when 3
@@ -735,8 +862,13 @@ class ContainerManager(ProfileMixin):
         # timeout.  A fresh session per _collect_state call avoids this entirely.
         fresh_bs = self._new_browser_session()
         try:
-            all_targets = fresh_bs.target.get_targets(
-                timeout=SNAPSHOT_CDP_TIMEOUT)
+            # If caller already fetched targets (e.g. snapshot_all), reuse
+            # them instead of opening another WebSocket + getTargets call.
+            if prefetched_targets is not None:
+                all_targets = prefetched_targets
+            else:
+                all_targets = fresh_bs.target.get_targets(
+                    timeout=SNAPSHOT_CDP_TIMEOUT)
             log.debug("_collect_state: %d total targets from Chrome", len(all_targets))
             tab_infos = [t for t in all_targets
                          if t.get("browserContextId") == ctx
@@ -908,7 +1040,8 @@ class ContainerManager(ProfileMixin):
                   len(storage), len(idb_data))
         return cookies, storage, idb_data, tabs_to_save
 
-    def snapshot(self, cid: str) -> dict:
+    def snapshot(self, cid: str,
+                 prefetched_targets: list[dict] | None = None) -> dict:
         """Persist current state without disposing the context. Crash-safe save."""
         log.debug("snapshot: cid=%s", cid)
         # Skip if crash recovery is currently in progress — Chrome is dead or
@@ -929,7 +1062,8 @@ class ContainerManager(ProfileMixin):
 
         # Collect state WITHOUT holding the lock (CDP calls can be slow)
         try:
-            cookies, storage, idb, tabs = self._collect_state(ctx)
+            cookies, storage, idb, tabs = self._collect_state(
+                ctx, prefetched_targets=prefetched_targets)
         except Exception as e:
             log.debug("snapshot: collect_state failed for %s: %s", cid, e)
             self._maybe_trigger_snapshot_crash_recovery(cid, e)
@@ -1014,16 +1148,49 @@ class ContainerManager(ProfileMixin):
             self._get_targets_cached(max_age=0)
         except Exception:
             pass
-        cids = list(self.hot.keys())
+        self._snapshot_cycle += 1
+        cycle = self._snapshot_cycle
+        now = time.time()
+        all_cids = list(self.hot.keys())
+        # Partition into active vs idle based on last focus activity
+        active_cids = []
+        idle_cids = []
+        for cid in all_cids:
+            last_active = self._session_last_active.get(cid, now)
+            if now - last_active <= self._IDLE_THRESHOLD_SEC:
+                active_cids.append(cid)
+            else:
+                idle_cids.append(cid)
+        # Idle sessions only snapshot every N-th cycle
+        if cycle % self._IDLE_SNAPSHOT_MULTIPLE == 0:
+            cids = active_cids + idle_cids
+        else:
+            cids = active_cids
+        if idle_cids:
+            log.debug("snapshot_all: cycle %d, %d active + %d idle%s",
+                      cycle, len(active_cids), len(idle_cids),
+                      " (idle included)" if cids == all_cids else " (idle skipped)")
         results: list[dict] = []
         try:
             if not cids:
                 return results
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(cids), 4)) as pool:
+                # Pre-fetch targets once for all parallel snapshots.
+                # This eliminates N redundant getTargets + WebSocket
+                # connections (one per container) during the cycle.
+                try:
+                    with self._new_browser_session() as pre_bs:
+                        shared_targets = pre_bs.target.get_targets(
+                            timeout=SNAPSHOT_CDP_TIMEOUT)
+                    log.debug("snapshot_all: pre-fetched %d targets",
+                              len(shared_targets))
+                except Exception:
+                    shared_targets = None
                 def _snap(cid):
                     try:
-                        return self.snapshot(cid)
+                        return self.snapshot(cid,
+                                            prefetched_targets=shared_targets)
                     except Exception as e:
                         log.warning("snapshot_all: %s failed: %s", cid, e)
                         return {"id": cid, "error": str(e)}
@@ -1098,11 +1265,7 @@ class ContainerManager(ProfileMixin):
                             log.debug("hibernate: closed %d tabs before dispose", len(ctx_tids))
                     except Exception as e:
                         log.debug("hibernate: pre-dispose tab close error (ignored): %s", e)
-                    try:
-                        bs.target.dispose_browser_context(ctx)
-                        log.debug("hibernate: context %s disposed", ctx)
-                    except CDPError as e:
-                        log.debug("hibernate: dispose CDPError (ignored): %s", e)
+                    self._dispose_context(bs, ctx, "hibernate")
             except Exception as e:
                 log.debug("hibernate: fresh session error (ignored): %s", e)
 
@@ -1185,6 +1348,7 @@ class ContainerManager(ProfileMixin):
             self.hot[cid] = ctx
             self.store.mark_active(cid, True)
             self.store.touch_accessed(cid)
+            self._session_last_active[cid] = time.time()
 
             urls = [t["url"] for t in row["tabs"]]
             if also_open_url and also_open_url not in urls:
@@ -1441,13 +1605,11 @@ class ContainerManager(ProfileMixin):
                     except Exception:
                         pass
                     if not is_prof:
-                        try:
-                            bs.target.dispose_browser_context(ctx)
-                        except CDPError as e:
-                            log.debug("delete: dispose CDPError (ignored): %s", e)
+                        self._dispose_context(bs, ctx, "delete")
             self.store.delete_container(cid)
             self._last_snapshot_time.pop(cid, None)
             self._last_snapshot_hash.pop(cid, None)
+            self._session_last_active.pop(cid, None)
             if is_prof:
                 self._profile_sessions.discard(cid)
                 cdp.delete_profile_dir(self._user_data_dir(), cid)

@@ -587,6 +587,140 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
                 pass
         self.assertEqual(len(crash_calls), 0)
 
+    def test_stale_hot_skipped_during_reconnect_grace(self):
+        """_check_stale_hot should not hibernate containers if a CDP
+        reconnect just happened (target list may be incomplete)."""
+        c = self.store.create_container("grace-stale")
+        self.store.save_hibernation(
+            c["id"],
+            [{"name": "s", "value": "v", "domain": "grace.com"}],
+            {"https://grace.com": {"k": "1"}},
+            [{"url": "https://grace.com/page", "title": "G"}])
+        self.mgr.restore(c["id"])
+        ctx = self.mgr.hot[c["id"]]
+        # Snapshot so there's data to preserve
+        for t in self.fb.targets.values():
+            if t.get("browserContextId") == ctx:
+                t["url"] = "https://grace.com/page"
+                self.fb.local_storage[t["targetId"]] = {
+                    "https://grace.com": {"k": "1"}}
+        self.fb.cookies[ctx] = [{"name": "s", "value": "v", "domain": "grace.com"}]
+        self.mgr.snapshot(c["id"])
+
+        # Remove all targets for this context (simulate incomplete list)
+        for tid in list(self.fb.targets):
+            if self.fb.targets[tid].get("browserContextId") == ctx:
+                del self.fb.targets[tid]
+
+        # Set reconnect grace period active
+        self.mgr._last_reconnect_mono = time.monotonic()
+
+        self.mgr._check_stale_hot()
+
+        # Container should STILL be hot — not hibernated during grace period
+        self.assertIn(c["id"], self.mgr.hot)
+
+    def test_stale_hot_hibernates_after_grace_expires(self):
+        """After the reconnect grace period expires, stale containers should
+        be hibernated normally."""
+        c = self.store.create_container("grace-expire")
+        self.store.save_hibernation(
+            c["id"],
+            [{"name": "s", "value": "v", "domain": "expire.com"}],
+            {"https://expire.com": {"k": "1"}},
+            [{"url": "https://expire.com/page", "title": "E"}])
+        self.mgr.restore(c["id"])
+        ctx = self.mgr.hot[c["id"]]
+        for t in self.fb.targets.values():
+            if t.get("browserContextId") == ctx:
+                t["url"] = "https://expire.com/page"
+                self.fb.local_storage[t["targetId"]] = {
+                    "https://expire.com": {"k": "1"}}
+        self.fb.cookies[ctx] = [{"name": "s", "value": "v", "domain": "expire.com"}]
+        self.mgr.snapshot(c["id"])
+
+        for tid in list(self.fb.targets):
+            if self.fb.targets[tid].get("browserContextId") == ctx:
+                del self.fb.targets[tid]
+
+        # Grace period expired
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+
+        self.mgr._check_stale_hot()
+
+        # Container should be hibernated
+        self.assertNotIn(c["id"], self.mgr.hot)
+
+    def test_dashboard_alive_deferred_during_reconnect_grace(self):
+        """_check_dashboard_alive should not trigger UI-close if the
+        dashboard target is missing but a reconnect just happened."""
+        self.mgr._dashboard_target_id = "dash-123"
+        close_calls = []
+        self.mgr._on_ui_close = lambda: close_calls.append(1)
+
+        # Seed a target that is NOT the dashboard
+        self.fb.seed_tab("CTX_other", "https://example.com")
+
+        # Reconnect just happened
+        self.mgr._last_reconnect_mono = time.monotonic()
+
+        self.mgr._check_dashboard_alive()
+
+        # Should NOT have triggered UI-close
+        self.assertEqual(len(close_calls), 0)
+        # Dashboard target ID should still be set (deferred)
+        self.assertEqual(self.mgr._dashboard_target_id, "dash-123")
+
+    def test_dashboard_alive_triggers_after_grace_expires(self):
+        """After the reconnect grace period, a missing dashboard target
+        should trigger UI-close normally."""
+        self.mgr._dashboard_target_id = "dash-456"
+        close_calls = []
+        self.mgr._on_ui_close = lambda: close_calls.append(1)
+
+        self.fb.seed_tab("CTX_other", "https://example.com")
+
+        # Grace period expired
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+
+        self.mgr._check_dashboard_alive()
+
+        self.assertEqual(len(close_calls), 1)
+        self.assertIsNone(self.mgr._dashboard_target_id)
+
+    def test_start_watcher_restarts_after_stop_timeout(self):
+        """If stop_watcher's join timed out, start_watcher should wait for
+        the old thread to finish and start a new one."""
+        # Create a watcher thread that will block until released
+        release = threading.Event()
+        entered = threading.Event()
+        def slow_loop():
+            entered.set()
+            release.wait(timeout=5)
+
+        self.mgr._watcher_stop.set()  # already told to stop
+        self.mgr._watcher_thread = threading.Thread(
+            target=slow_loop, daemon=True)
+        self.mgr._watcher_thread.start()
+        entered.wait(timeout=2)
+
+        # The old thread is alive with stop_event set — simulates
+        # the race condition from snapshot_all's join timeout.
+        self.assertTrue(self.mgr._watcher_thread.is_alive())
+        self.assertTrue(self.mgr._watcher_stop.is_set())
+
+        # Release the old thread so start_watcher's join succeeds
+        release.set()
+        time.sleep(0.1)
+
+        # Patch _watcher_loop to just exit immediately
+        self.mgr._watcher_loop = lambda: None
+        self.mgr.start_watcher()
+
+        # A new thread should have been created and started
+        self.assertFalse(self.mgr._watcher_stop.is_set())
+        self.mgr._watcher_thread.join(timeout=2)
+
     def test_chrome_http_reachable_retries(self):
         """_chrome_http_reachable should retry and succeed if Chrome responds
         on a later attempt."""

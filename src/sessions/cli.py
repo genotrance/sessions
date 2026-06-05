@@ -51,6 +51,21 @@ def setup_logging(debug: bool = False, log_path: str | None = None) -> None:
                      f"  PROCESS START  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                      f"{'-'*80}\n")
     logging.root.setLevel(level)
+    # Install global exception hooks so silent crashes leave a trace
+    _log = logging.getLogger("sessions")
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        _log.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _threading_excepthook(args):
+        _log.critical("Unhandled exception in thread %s",
+                      args.thread.name if args.thread else "?",
+                      exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _threading_excepthook
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +360,13 @@ def cmd_start(args) -> int:
             log.warning("recover_chrome: Chrome appears dead, verifying "
                         "with grace period…")
             import time as _time
-            for attempt in range(3):
-                _time.sleep(2)
-                if manager._chrome_http_reachable(retries=2,
-                                                  per_timeout=(2, 5)):
+            for attempt in range(2):
+                _time.sleep(1)
+                if manager._chrome_http_reachable(retries=1,
+                                                  per_timeout=(2, 3)):
                     log.warning("recover_chrome: Chrome became reachable "
                                 "after %ds grace, aborting recovery",
-                                (attempt + 1) * 2)
+                                attempt + 1)
                     manager._invalidate_browser_session()
                     manager._snapshot_cdp_failures = 0
                     return
@@ -395,6 +410,12 @@ def cmd_start(args) -> int:
                 graceful_exit()
                 return
             chrome_mgr = _chrome_ref[0]
+            # Log Chrome process state for crash diagnosis
+            proc = getattr(chrome_mgr, '_proc', None)
+            if proc is not None:
+                rc = proc.poll()
+                log.warning("recover_chrome: Chrome PID=%s exit_code=%s",
+                            proc.pid, rc)
             log.debug("recover_chrome: force-stopping Chrome before restart")
             try:
                 chrome_mgr.stop(force=True)

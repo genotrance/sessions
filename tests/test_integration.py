@@ -1042,9 +1042,9 @@ class TestSnapshotLockSafety(_PatchedManagerMixin, unittest.TestCase):
         # Wrap _collect_state to change ctx mid-collection
         real_collect = self.mgr._collect_state
 
-        def sneaky_collect(ctx):
+        def sneaky_collect(ctx, **kwargs):
             # Simulate: between unlock and re-lock, the container got re-restored
-            result = real_collect(ctx)
+            result = real_collect(ctx, **kwargs)
             # Change the hot entry to a different ctx (simulating concurrent restore)
             self.mgr.hot[c["id"]] = "DIFFERENT_CTX"
             return result
@@ -1065,8 +1065,8 @@ class TestSnapshotLockSafety(_PatchedManagerMixin, unittest.TestCase):
 
         real_collect = self.mgr._collect_state
 
-        def sneaky_collect(ctx):
-            result = real_collect(ctx)
+        def sneaky_collect(ctx, **kwargs):
+            result = real_collect(ctx, **kwargs)
             # Simulate deletion mid-collection
             del self.mgr.hot[c["id"]]
             return result

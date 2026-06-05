@@ -353,11 +353,15 @@ class ChromeManager:
             pass
 
     def launch_profile(self, profile_name: str,
-                       start_url: str = "about:blank") -> None:
+                       start_url: str | None = "about:blank") -> None:
         """Open a Chrome profile window in the already-running Chrome instance.
 
         Chrome's singleton IPC mechanism detects the existing process and sends
         the profile-open command to it, so no new process is spawned.
+
+        If *start_url* is ``None``, no URL is passed on the command line and
+        Chrome opens whatever its profile preferences dictate (e.g.
+        ``restore_on_startup`` / ``startup_urls``).
         """
         if not self.chrome_path:
             raise RuntimeError("No browser binary configured")
@@ -365,8 +369,9 @@ class ChromeManager:
             self.chrome_path,
             f"--user-data-dir={self.user_data_dir}",
             f"--profile-directory={profile_name}",
-            start_url,
         ]
+        if start_url is not None:
+            args.append(start_url)
         log.debug("launch_profile: %s", " ".join(args))
         popen_kwargs: dict[str, Any] = {"stdout": subprocess.PIPE,
                                         "stderr": subprocess.PIPE}
@@ -657,6 +662,65 @@ def _remove_from_local_state(user_data_dir: str, cid: str) -> None:
                 json.dump(state, f)
         except OSError:
             pass
+
+
+def update_profile_prefs_for_restore(user_data_dir: str, cid: str,
+                                     urls: list[str]) -> None:
+    """Update a profile's Preferences so Chrome opens *urls* on next launch.
+
+    Sets ``restore_on_startup`` to 4 ("open specific pages") with
+    ``startup_urls`` populated from the shadow tab list.  Also marks the
+    profile as cleanly exited so Chrome does **not** show the
+    "Chrome didn't shut down correctly" bar, which would duplicate
+    tabs when the user clicks "Restore".
+
+    Call this *before* ``launch_profile()`` during crash recovery or
+    hibernation restore so that Chrome opens every tab seamlessly.
+    """
+    path = profile_dir_path(user_data_dir, cid)
+    prefs_path = os.path.join(path, "Preferences")
+    prefs: dict = {}
+    if os.path.isfile(prefs_path):
+        try:
+            with open(prefs_path, encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            prefs = {}
+    if urls:
+        prefs["session"] = {"restore_on_startup": 4,
+                            "startup_urls": urls}
+    else:
+        prefs["session"] = {"restore_on_startup": 1}
+    prefs.setdefault("profile", {})["exit_type"] = "Normal"
+    prefs["profile"]["exited_cleanly"] = True
+    os.makedirs(path, exist_ok=True)
+    with open(prefs_path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f)
+    log.debug("update_profile_prefs_for_restore: cid=%s urls=%d", cid, len(urls))
+
+
+def reset_profile_prefs_after_launch(user_data_dir: str, cid: str) -> None:
+    """Reset a profile back to ``restore_on_startup: 1`` (restore last session).
+
+    Called *after* the profile window has been opened so that subsequent
+    Chrome restarts (user-initiated or crash) use Chrome's native session
+    restore rather than the one-time startup_urls list.
+    """
+    path = profile_dir_path(user_data_dir, cid)
+    prefs_path = os.path.join(path, "Preferences")
+    if not os.path.isfile(prefs_path):
+        return
+    try:
+        with open(prefs_path, encoding="utf-8") as f:
+            prefs = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    prefs["session"] = {"restore_on_startup": 1}
+    try:
+        with open(prefs_path, "w", encoding="utf-8") as f:
+            json.dump(prefs, f)
+    except OSError:
+        pass
 
 
 def save_profile_tabs(user_data_dir: str, cid: str,
