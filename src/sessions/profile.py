@@ -227,7 +227,18 @@ class ProfileMixin:
         log.debug("_restore_profile: cid=%s also_open_url=%s", cid, also_open_url)
         chrome_mgr = self._chrome_mgr
         if not chrome_mgr:
-            raise RuntimeError("No ChromeManager configured for profile sessions")
+            # Lazy fallback: ensure_chrome may have failed at startup while
+            # Chrome was still starting up.  Try to create a ChromeManager now.
+            try:
+                cm = cdp.ChromeManager(port=self.browser_port)
+                if cm.is_running():
+                    self._chrome_mgr = cm
+                    chrome_mgr = cm
+                    log.debug("_restore_profile: lazily created ChromeManager")
+            except Exception:
+                pass
+            if not chrome_mgr:
+                raise RuntimeError("No ChromeManager configured for profile sessions")
 
         prof_name = row.get("profile_dir") or profile_dir_name(cid)
         # Ensure profile directory exists with session restore prefs

@@ -824,5 +824,69 @@ class TestProfileRestoreAlreadyLoaded(_PatchedManagerMixin, unittest.TestCase):
         self.assertNotIn("ctx not in known_ctxs", src)
 
 
+# ---------------------------------------------------------------------------
+# FIX: Lazy _chrome_mgr fallback when ensure_chrome failed at startup
+# ---------------------------------------------------------------------------
+
+class TestLazyChromeMgr(_PatchedManagerMixin, unittest.TestCase):
+
+    def _make_profile_session(self, urls=None):
+        """Create a hibernated profile session ready for restore."""
+        if urls is None:
+            urls = ["https://example.com"]
+        self.mgr._chrome_mgr = type(
+            "CM", (), {"user_data_dir": self.tmp, "chrome_path": "chrome"})()
+        # Stub launch_profile so it simulates Chrome opening tabs
+        fb = self.fb
+        def fake_launch(prof, start_url="about:blank"):
+            new_ctx = f"CTX-LAZY-{prof}"
+            for u in urls:
+                fb.seed_tab(new_ctx, u, "")
+        self.mgr._chrome_mgr.launch_profile = fake_launch
+        c = self.mgr.create_container("lazy-prof", session_type="profile")
+        tabs = [{"url": u, "title": ""} for u in urls]
+        cdp.save_profile_tabs(self.tmp, c["id"], tabs)
+        self.store.save_hibernation(c["id"], [], {}, tabs)
+        # Clear _chrome_mgr to simulate startup failure
+        self.mgr._chrome_mgr = None
+        return c
+
+    def test_restore_profile_lazy_creates_chrome_mgr(self):
+        """If _chrome_mgr is None but Chrome is reachable, _restore_profile
+        should lazily create a ChromeManager and succeed."""
+        from unittest import mock
+        urls = ["https://example.com"]
+        c = self._make_profile_session(urls)
+        # Build a fake CM with launch_profile that seeds targets
+        fb = self.fb
+        fake_cm = type("CM", (), {
+            "user_data_dir": self.tmp,
+            "chrome_path": "chrome",
+        })()
+        def fake_launch(prof, start_url="about:blank"):
+            new_ctx = f"CTX-LAZY-{prof}"
+            for u in urls:
+                fb.seed_tab(new_ctx, u, "")
+        fake_cm.launch_profile = fake_launch
+        fake_cm.is_running = lambda: True
+        with mock.patch.object(cdp, "ChromeManager", return_value=fake_cm):
+            self.mgr.restore(c["id"])
+        self.assertIn(c["id"], self.mgr.hot)
+        self.assertIs(self.mgr._chrome_mgr, fake_cm)
+
+    def test_restore_profile_fails_when_chrome_unreachable(self):
+        """If _chrome_mgr is None and Chrome is unreachable, raise."""
+        c = self._make_profile_session()
+        from unittest import mock
+        fake_cm = type("CM", (), {
+            "user_data_dir": self.tmp,
+            "is_running": lambda: False,
+        })()
+        with mock.patch.object(cdp, "ChromeManager", return_value=fake_cm):
+            with self.assertRaises(RuntimeError):
+                self.mgr.restore(c["id"])
+        self.assertNotIn(c["id"], self.mgr.hot)
+
+
 if __name__ == "__main__":
     unittest.main()

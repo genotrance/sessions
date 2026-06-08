@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-06-07
+
+### Fixed
+
+- **Profile restore after slow Chrome startup**: When Chrome was already running but slow to respond on the debug port (e.g. after a daemon restart), `ensure_chrome` timed out and `_chrome_mgr` was never set. Profile session restores would then fail with "No ChromeManager configured". Now `_post_start` falls back to connecting to the existing Chrome process, and `_restore_profile` lazily creates a `ChromeManager` if Chrome is reachable.
+
 ## [0.2.2] - 2026-05-30
 
 ### Fixed

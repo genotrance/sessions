@@ -490,8 +490,25 @@ def cmd_start(args) -> int:
             log.debug("_post_start: waiting for Chrome…")
             _chrome_ready.wait(timeout=30)
             if _chrome_error:
-                log.error("_post_start: Chrome failed to start: %s", _chrome_error[0])
-                return
+                log.warning("_post_start: ensure_chrome failed: %s — "
+                            "trying to connect to existing Chrome",
+                            _chrome_error[0])
+                # ensure_chrome failed (e.g. Chrome was slow to start), but
+                # Chrome may still be running.  Try to create a ChromeManager
+                # pointing at the existing process so profile sessions work.
+                try:
+                    cm = cdp.ChromeManager(port=args.browser_port)
+                    if cm.is_running():
+                        _chrome_ref.append(cm)
+                        log.debug("_post_start: connected to existing Chrome")
+                    else:
+                        log.error("_post_start: Chrome not reachable, "
+                                  "profile sessions will be unavailable")
+                        return
+                except Exception as e2:
+                    log.error("_post_start: fallback ChromeManager failed: "
+                              "%s, profile sessions will be unavailable", e2)
+                    return
             log.debug("_post_start running")
             if _chrome_ref:
                 manager._chrome_mgr = _chrome_ref[0]
