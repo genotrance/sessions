@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-06-09
+
+### Fixed
+
+- **False-positive crash recovery after long sleep**: After waking from a multi-hour sleep, Chrome's debug port could be briefly responsive then hang again while Chrome stabilised. The fixed 15-second cooldown expired too early, triggering crash recovery that force-killed a healthy Chrome (process alive, `exit_code=None`). Cooldown now scales with sleep duration (15s base, up to 120s for long sleeps). Additionally, `recover_chrome` checks whether the Chrome process is still alive before force-killing, giving the debug port up to 30 extra seconds to recover. If Chrome restart fails, the backend now polls for Chrome to come back on its own rather than abandoning all containers.
+
 ## [0.2.3] - 2026-06-07
 
 ### Fixed

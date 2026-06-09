@@ -372,6 +372,34 @@ def cmd_start(args) -> int:
                     return
             log.warning("recover_chrome: Chrome confirmed dead after "
                         "grace period, proceeding with restart")
+            # Check if Chrome process is actually alive but its debug port
+            # is just hung (common after long sleeps).  If so, give it an
+            # extended grace period before force-killing.
+            if _chrome_ref:
+                proc = getattr(_chrome_ref[0], '_proc', None)
+                if proc is not None:
+                    rc = proc.poll()
+                    log.warning("recover_chrome: Chrome PID=%s exit_code=%s",
+                                proc.pid, rc)
+                    if rc is None:
+                        # Process alive — debug port hung.  Wait longer.
+                        log.warning("recover_chrome: Chrome process alive "
+                                    "but debug port hung, extended wait…")
+                        for ext in range(6):
+                            _time.sleep(5)
+                            if manager._chrome_http_reachable(
+                                    retries=1, per_timeout=(3, 5)):
+                                log.warning("recover_chrome: Chrome came "
+                                            "back after %ds extended wait, "
+                                            "aborting recovery",
+                                            (ext + 1) * 5)
+                                manager._invalidate_browser_session()
+                                manager._snapshot_cdp_failures = 0
+                                manager._dashboard_cdp_failures = 0
+                                return
+                        log.warning("recover_chrome: Chrome process alive "
+                                    "but debug port still dead after 30s "
+                                    "extended wait, will force-kill")
             # 1. Clear in-memory hot map (browser contexts are gone) and
             #    check DB is_active to learn which containers the user
             #    intended to keep alive vs. those already marked for
@@ -410,12 +438,6 @@ def cmd_start(args) -> int:
                 graceful_exit()
                 return
             chrome_mgr = _chrome_ref[0]
-            # Log Chrome process state for crash diagnosis
-            proc = getattr(chrome_mgr, '_proc', None)
-            if proc is not None:
-                rc = proc.poll()
-                log.warning("recover_chrome: Chrome PID=%s exit_code=%s",
-                            proc.pid, rc)
             log.debug("recover_chrome: force-stopping Chrome before restart")
             try:
                 chrome_mgr.stop(force=True)
@@ -427,9 +449,23 @@ def cmd_start(args) -> int:
                 chrome_mgr.start(headless=getattr(args, 'headless', False), timeout=30)
                 log.debug("recover_chrome: Chrome restarted successfully")
             except Exception as e:
-                log.error("recover_chrome: Chrome restart failed (%s), will retry on next crash detection", e)
-                # Don't exit — let crash detection retry on the next cycle
-                return
+                log.error("recover_chrome: Chrome restart failed (%s), "
+                          "will poll for recovery", e)
+                # Restart failed, but Chrome may come up on its own.
+                # Poll for a while before giving up completely.
+                for _poll in range(6):
+                    _time.sleep(5)
+                    if manager._chrome_http_reachable(
+                            retries=1, per_timeout=(3, 5)):
+                        log.warning("recover_chrome: Chrome became "
+                                    "reachable after restart failure, "
+                                    "reconnecting")
+                        manager._invalidate_browser_session()
+                        break
+                else:
+                    log.error("recover_chrome: Chrome still unreachable "
+                              "after polling, containers lost")
+                    return
             # 4. Reopen the dashboard tab
             if not getattr(args, 'no_browser_open', False):
                 manager.open_dashboard_in_default_tab(dash_url)

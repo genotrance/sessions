@@ -166,7 +166,8 @@ class ContainerManager(ProfileMixin):
     # sleep/wake cycle.  After such a gap, failure counters are reset and
     # crash recovery is suppressed for a cooldown period.
     _SLEEP_GAP_SEC = 30
-    _SLEEP_COOLDOWN_SEC = 15
+    _SLEEP_COOLDOWN_SEC = 15       # base cooldown (short sleeps)
+    _SLEEP_COOLDOWN_MAX_SEC = 120   # cap for very long sleeps
     # Warn when Chrome has this many targets — resource pressure risk.
     _TARGET_COUNT_WARNING_THRESHOLD = 80
     # Grace period (seconds) after a CDP reconnect during which stale-hot
@@ -479,15 +480,19 @@ class ContainerManager(ProfileMixin):
             _last_tick_mono = now_mono
             # Detect sleep/wake: wall-clock gap >> expected interval
             if gap > self._SLEEP_GAP_SEC:
+                # Scale cooldown with sleep duration: short naps get 15s,
+                # multi-hour sleeps get up to 120s for Chrome to stabilise.
+                cooldown = min(
+                    self._SLEEP_COOLDOWN_MAX_SEC,
+                    max(self._SLEEP_COOLDOWN_SEC, int(gap / 60)))
                 log.warning("watcher: detected sleep/wake (gap=%.1fs), "
                             "resetting failure counters, cooldown %ds",
-                            gap, self._SLEEP_COOLDOWN_SEC)
+                            gap, cooldown)
                 _consecutive_failures = 0
                 self._snapshot_cdp_failures = 0
                 self._dashboard_cdp_failures = getattr(
                     self, '_dashboard_cdp_failures', 0) and 0
-                self._sleep_cooldown_until = (
-                    now_mono + self._SLEEP_COOLDOWN_SEC)
+                self._sleep_cooldown_until = now_mono + cooldown
                 self._invalidate_browser_session()
                 continue  # skip this tick entirely, let Chrome settle
             log.debug("watcher tick %d, hot=%d", _tick, len(self.hot))

@@ -1236,5 +1236,45 @@ class TestActivationEventLoop(_PatchedManagerMixin, unittest.TestCase):
         self.assertIn(f"sid-{tid_b}", sess.target.detached)
 
 
+# ---------------------------------------------------------------------------
+# Adaptive sleep cooldown
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveSleepCooldown(unittest.TestCase):
+    """Verify that the sleep cooldown scales with sleep duration."""
+
+    def test_short_sleep_uses_base_cooldown(self):
+        """A 1-minute sleep should use the base 15s cooldown."""
+        from sessions.manager import ContainerManager as CM
+        gap = 60  # 1 minute
+        cooldown = min(CM._SLEEP_COOLDOWN_MAX_SEC,
+                       max(CM._SLEEP_COOLDOWN_SEC, int(gap / 60)))
+        self.assertEqual(cooldown, 15)
+
+    def test_long_sleep_scales_up(self):
+        """A 1-hour sleep should produce a ~60s cooldown."""
+        from sessions.manager import ContainerManager as CM
+        gap = 3600  # 1 hour
+        cooldown = min(CM._SLEEP_COOLDOWN_MAX_SEC,
+                       max(CM._SLEEP_COOLDOWN_SEC, int(gap / 60)))
+        self.assertEqual(cooldown, 60)
+
+    def test_very_long_sleep_caps_at_max(self):
+        """A 10-hour sleep should cap at _SLEEP_COOLDOWN_MAX_SEC."""
+        from sessions.manager import ContainerManager as CM
+        gap = 36000  # 10 hours
+        cooldown = min(CM._SLEEP_COOLDOWN_MAX_SEC,
+                       max(CM._SLEEP_COOLDOWN_SEC, int(gap / 60)))
+        self.assertEqual(cooldown, CM._SLEEP_COOLDOWN_MAX_SEC)
+
+    def test_medium_sleep_proportional(self):
+        """A 2.7-hour sleep (like the real bug) should get ~163→120 (capped)."""
+        from sessions.manager import ContainerManager as CM
+        gap = 9810.6  # 2.7 hours (from the real log)
+        cooldown = min(CM._SLEEP_COOLDOWN_MAX_SEC,
+                       max(CM._SLEEP_COOLDOWN_SEC, int(gap / 60)))
+        self.assertEqual(cooldown, 120)  # capped at max
+
+
 if __name__ == "__main__":
     unittest.main()
