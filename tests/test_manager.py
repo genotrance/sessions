@@ -546,7 +546,11 @@ class TestContainerManagerNew(_PatchedManagerMixin, unittest.TestCase):
         # Simulate the watcher loop with a large time gap by patching
         # time.monotonic at the module level that manager.py imports.
         base = time.monotonic()
-        mono_values = iter([base, base + 120])  # 120s gap = sleep/wake
+        # _last_watcher_tick_mono is now an instance attribute (persists
+        # across watcher restarts).  Set it so the first mock monotonic
+        # value produces a 120s gap.
+        self.mgr._last_watcher_tick_mono = base
+        mono_values = iter([base + 120])  # 120s gap = sleep/wake
         self.mgr._watcher_stop.clear()
         orig_wait = self.mgr._watcher_stop.wait
         tick_count = [0]
@@ -1234,6 +1238,121 @@ class TestActivationEventLoop(_PatchedManagerMixin, unittest.TestCase):
 
         # tid_b's session should have been detached
         self.assertIn(f"sid-{tid_b}", sess.target.detached)
+
+
+# ---------------------------------------------------------------------------
+# Post-sleep stability (v0.2.5)
+# ---------------------------------------------------------------------------
+
+class TestPostSleepStability(_PatchedManagerMixin, unittest.TestCase):
+    """Tests for stability fixes after sleep/wake cycles."""
+
+    def test_stale_hot_skipped_during_sleep_cooldown(self):
+        """_check_stale_hot should defer hibernation during sleep cooldown,
+        not just during reconnect grace."""
+        c = self.store.create_container("sleep-stale")
+        self.store.save_hibernation(
+            c["id"],
+            [{"name": "s", "value": "v", "domain": "sleepy.com"}],
+            {"https://sleepy.com": {"k": "1"}},
+            [{"url": "https://sleepy.com/page", "title": "S"}])
+        self.mgr.restore(c["id"])
+        ctx = self.mgr.hot[c["id"]]
+        for t in self.fb.targets.values():
+            if t.get("browserContextId") == ctx:
+                t["url"] = "https://sleepy.com/page"
+                self.fb.local_storage[t["targetId"]] = {
+                    "https://sleepy.com": {"k": "1"}}
+        self.fb.cookies[ctx] = [
+            {"name": "s", "value": "v", "domain": "sleepy.com"}]
+        self.mgr.snapshot(c["id"])
+
+        # Remove all targets for this context (simulates Chrome discarding
+        # browser contexts during sleep)
+        for tid in list(self.fb.targets):
+            if self.fb.targets[tid].get("browserContextId") == ctx:
+                del self.fb.targets[tid]
+
+        # Reconnect grace expired, but sleep cooldown active
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+        self.mgr._sleep_cooldown_until = time.monotonic() + 60
+
+        self.mgr._check_stale_hot()
+
+        # Container should STILL be hot — not hibernated during sleep cooldown
+        self.assertIn(c["id"], self.mgr.hot)
+
+    def test_dashboard_alive_deferred_during_sleep_cooldown(self):
+        """_check_dashboard_alive should not trigger UI-close if the
+        dashboard target is missing but sleep cooldown is active."""
+        self.mgr._dashboard_target_id = "dash-sleep"
+        close_calls = []
+        self.mgr._on_ui_close = lambda: close_calls.append(1)
+
+        self.fb.seed_tab("CTX_other", "https://example.com")
+
+        # Reconnect grace expired, but sleep cooldown active
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+        self.mgr._sleep_cooldown_until = time.monotonic() + 60
+
+        self.mgr._check_dashboard_alive()
+
+        self.assertEqual(len(close_calls), 0)
+        self.assertEqual(self.mgr._dashboard_target_id, "dash-sleep")
+
+    def test_dashboard_reopen_after_sleep(self):
+        """When the dashboard target is gone but Chrome is alive and
+        _dashboard_url is set, the dashboard should be reopened instead
+        of triggering UI-close."""
+        self.mgr._dashboard_target_id = "dash-gone"
+        self.mgr._dashboard_url = "http://127.0.0.1:9876/"
+        close_calls = []
+        self.mgr._on_ui_close = lambda: close_calls.append(1)
+
+        self.fb.seed_tab("CTX_other", "https://example.com")
+
+        # Grace and cooldown expired — but dashboard_url is set
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+        self.mgr._sleep_cooldown_until = 0
+
+        self.mgr._check_dashboard_alive()
+
+        # Should have reopened the dashboard, NOT triggered UI-close
+        self.assertEqual(len(close_calls), 0)
+        # Dashboard target ID should be updated to the new tab
+        self.assertIsNotNone(self.mgr._dashboard_target_id)
+        self.assertNotEqual(self.mgr._dashboard_target_id, "dash-gone")
+
+    def test_dashboard_exit_without_url(self):
+        """When _dashboard_url is not set and dashboard target is gone,
+        UI-close should still trigger (backward compat with explicit close)."""
+        self.mgr._dashboard_target_id = "dash-nourl"
+        self.mgr._dashboard_url = None
+        close_calls = []
+        self.mgr._on_ui_close = lambda: close_calls.append(1)
+
+        self.fb.seed_tab("CTX_other", "https://example.com")
+
+        self.mgr._last_reconnect_mono = time.monotonic() - 20
+        self.mgr._sleep_cooldown_until = 0
+
+        self.mgr._check_dashboard_alive()
+
+        self.assertEqual(len(close_calls), 1)
+        self.assertIsNone(self.mgr._dashboard_target_id)
+
+    def test_watcher_tick_mono_survives_restart(self):
+        """_last_watcher_tick_mono should persist across watcher
+        stop/start cycles (snapshot_all) so sleep detection is not lost."""
+        old_mono = self.mgr._last_watcher_tick_mono
+        time.sleep(0.05)
+        # Simulate snapshot_all stopping and restarting watcher
+        self.mgr.stop_watcher()
+        self.mgr.start_watcher()
+        # The instance attribute should not have been reset to "now"
+        # by the new watcher thread (it's set in __init__ only)
+        self.assertEqual(self.mgr._last_watcher_tick_mono, old_mono)
+        self.mgr.stop_watcher(stop_evt_thread=True)
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] - 2026-06-10
+
+### Fixed
+
+- **Backend exiting after sleep/wake**: Chrome discards browser contexts and tabs during long sleep. The backend mistook the missing dashboard tab for a user-initiated close and called `graceful_exit`. Now `_check_dashboard_alive` defers during sleep cooldown, and when the dashboard tab disappears while Chrome is still alive, it reopens the dashboard instead of exiting.
+- **Premature session hibernation after sleep**: `_check_stale_hot` only checked the short reconnect grace period (15s) before hibernating sessions whose contexts were gone. It now also checks the adaptive sleep cooldown, giving Chrome time to stabilise before making destructive decisions.
+- **Sleep detection lost across watcher restarts**: `snapshot_all` stops and restarts the watcher thread. The new thread's tick timestamp was reset, making it blind to any sleep that occurred during the snapshot cycle. The timestamp is now an instance attribute that persists across restarts.
+- **Backend killed by transient recovery errors**: If `recover_chrome` hit an unexpected exception, it called `graceful_exit`, killing the entire backend. Now it logs the error and lets the next crash-detection cycle retry.
+
 ## [0.2.4] - 2026-06-09
 
 ### Fixed

@@ -109,6 +109,7 @@ class ContainerManager(ProfileMixin):
         self._watcher_stop = threading.Event()
         self._watcher_thread: threading.Thread | None = None
         self._dashboard_target_id: str | None = None
+        self._dashboard_url: str | None = None  # for auto-reopen after sleep
         self._on_ui_close: Any = None  # callback when dashboard window closed
         self._on_chrome_crash: Any = None  # callback: Chrome process died unexpectedly
         # Snapshot caching: {cid: epoch} of last successful snapshot
@@ -143,6 +144,9 @@ class ContainerManager(ProfileMixin):
         # Monotonic timestamp of last CDP reconnect — used to suppress
         # false-positive stale/dashboard checks right after reconnect.
         self._last_reconnect_mono: float = 0
+        # Preserved across watcher restarts (snapshot_all stops/starts the
+        # watcher) so that sleep detection is not lost.
+        self._last_watcher_tick_mono: float = time.monotonic()
 
     # -- low-level CDP helpers ------------------------------------------------
 
@@ -472,12 +476,11 @@ class ContainerManager(ProfileMixin):
     def _watcher_loop(self) -> None:
         _consecutive_failures = 0
         _tick = 0
-        _last_tick_mono = time.monotonic()
         while not self._watcher_stop.wait(WINDOW_WATCHER_INTERVAL_SEC):
             _tick += 1
             now_mono = time.monotonic()
-            gap = now_mono - _last_tick_mono
-            _last_tick_mono = now_mono
+            gap = now_mono - self._last_watcher_tick_mono
+            self._last_watcher_tick_mono = now_mono
             # Detect sleep/wake: wall-clock gap >> expected interval
             if gap > self._SLEEP_GAP_SEC:
                 # Scale cooldown with sleep duration: short naps get 15s,
@@ -579,11 +582,25 @@ class ContainerManager(ProfileMixin):
         if not any(t.get("targetId") == tid for t in targets):
             # After a fresh CDP reconnect the target list may be incomplete;
             # defer the exit decision until the grace period expires.
-            if self._in_reconnect_grace():
-                log.debug("dashboard target %s not found, but in reconnect "
-                          "grace period — deferring", tid)
+            if self._in_reconnect_grace() or self._in_sleep_cooldown():
+                log.debug("dashboard target %s not found, but in grace/"
+                          "cooldown period — deferring", tid)
                 return
-            log.debug("dashboard target %s gone, triggering UI-close", tid)
+            # Chrome is alive but the dashboard tab is gone.  This can
+            # happen after sleep (Chrome discards tabs) — try to reopen
+            # the dashboard instead of shutting down.
+            if self._dashboard_url:
+                log.warning("dashboard target %s gone, attempting reopen",
+                            tid)
+                new_tid = self.open_dashboard_in_default_tab(
+                    self._dashboard_url)
+                if new_tid:
+                    log.info("dashboard reopened as %s", new_tid)
+                    return
+                log.warning("dashboard reopen failed, triggering UI-close")
+            else:
+                log.debug("dashboard target %s gone, triggering UI-close",
+                          tid)
             self._dashboard_target_id = None
             self._on_ui_close()
 
@@ -741,11 +758,13 @@ class ContainerManager(ProfileMixin):
 
         if stale_cids:
             log.debug("_check_stale_hot: stale cids=%s", stale_cids)
-        # After a CDP reconnect the target list may be incomplete — defer
-        # hibernation so we don't falsely conclude all windows are closed.
-        if stale_cids and self._in_reconnect_grace():
+        # After a CDP reconnect or sleep/wake the target list may be
+        # incomplete — defer hibernation so we don't falsely conclude all
+        # windows are closed.
+        if stale_cids and (self._in_reconnect_grace()
+                           or self._in_sleep_cooldown()):
             log.debug("_check_stale_hot: skipping hibernate for %d stale "
-                       "cids (reconnect grace period)", len(stale_cids))
+                       "cids (reconnect/sleep grace period)", len(stale_cids))
             return
         for cid in stale_cids:
             try:

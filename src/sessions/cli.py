@@ -434,8 +434,8 @@ def cmd_start(args) -> int:
             manager._dashboard_target_id = None
             # 2. Kill hung Chrome (if any) before restart
             if not _chrome_ref:
-                log.error("recover_chrome: no ChromeManager ref, falling back to exit")
-                graceful_exit()
+                log.error("recover_chrome: no ChromeManager ref, cannot "
+                          "restart — will retry on next crash detection")
                 return
             chrome_mgr = _chrome_ref[0]
             log.debug("recover_chrome: force-stopping Chrome before restart")
@@ -504,8 +504,7 @@ def cmd_start(args) -> int:
                         "%d restored, %d left hibernated",
                         len(reconnected_cids), len(remaining), len(skip_cids))
         except Exception as e:
-            log.error("recover_chrome: unexpected error: %s", e)
-            graceful_exit()
+            log.exception("recover_chrome: unexpected error: %s", e)
         finally:
             _recovering.release()
 
@@ -519,6 +518,7 @@ def cmd_start(args) -> int:
             pass
 
     dash_url = f"http://127.0.0.1:{args.api_port}/"
+    manager._dashboard_url = dash_url
 
     def _post_start():
         try:
