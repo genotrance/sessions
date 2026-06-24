@@ -1465,7 +1465,8 @@ class TestProfileAvatars(unittest.TestCase):
         self.assertTrue(url.startswith("chrome://theme/IDR_PROFILE_AVATAR_"))
 
     def test_register_in_local_state_uses_avatar(self):
-        import tempfile, json
+        import tempfile
+        import json
         with tempfile.TemporaryDirectory() as tmpdir:
             cdp._register_in_local_state(tmpdir, "test-cid")
             ls_path = os.path.join(tmpdir, "Local State")

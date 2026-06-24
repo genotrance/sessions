@@ -793,7 +793,6 @@ def update_profile_display(user_data_dir: str, cid: str,
     ``Local State`` so the name and icon are visible in the titlebar,
     taskbar, and Alt-Tab.
     """
-    avatar = _avatar_icon_for_index(_avatar_index_for_cid(cid))
     # Update profile Preferences
     prefs_path = os.path.join(profile_dir_path(user_data_dir, cid),
                               "Preferences")
