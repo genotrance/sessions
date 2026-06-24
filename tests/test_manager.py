@@ -1049,12 +1049,16 @@ class _MockFocusSession:
         self.target = _MockFocusTarget(targets_fn)
         self._focus_fn = focus_fn
         self.closed = False
+        self.ws = None  # no real WebSocket — _drain_events will skip
 
     def send(self, method, params=None, session_id=None, timeout=None):
         if method == "Runtime.evaluate":
             tid = session_id.replace("sid-", "") if session_id else ""
             return {"result": {"value": self._focus_fn(tid)}}
         return {}
+
+    def _dispatch_event(self, msg):
+        pass
 
     def close(self):
         self.closed = True
@@ -1066,6 +1070,7 @@ class TestActivationEventLoop(_PatchedManagerMixin, unittest.TestCase):
     def _run_loop(self, duration: float = 0.6):
         """Start the activation loop, run for *duration* seconds, then stop."""
         self.mgr._FOCUS_POLL_INTERVAL = 0.1
+        self.mgr._EVENT_LISTEN_INTERVAL = 0.05
         self.mgr._FOCUS_REBUILD_INTERVAL = 0.1
         self.mgr._RECONNECT_SETTLE_SEC = 0
         self.mgr._evt_stop.clear()
@@ -1221,7 +1226,9 @@ class TestActivationEventLoop(_PatchedManagerMixin, unittest.TestCase):
         with mock.patch("sessions.cdp.CDPSession.connect_browser", return_value=sess):
             # Let it attach both
             self.mgr._FOCUS_POLL_INTERVAL = 0.1
+            self.mgr._EVENT_LISTEN_INTERVAL = 0.05
             self.mgr._FOCUS_REBUILD_INTERVAL = 0.1
+            self.mgr._RECONNECT_SETTLE_SEC = 0
             self.mgr._evt_stop.clear()
             t = threading.Thread(target=self.mgr._activation_event_loop, daemon=True)
             t.start()

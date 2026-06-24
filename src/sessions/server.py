@@ -137,7 +137,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "nothing to update"}, status=400)
             if method == "DELETE" and action == "tab":
                 url = self._body().get("url", "")
-                ok = self.manager.store.delete_tab(cid, url)
+                ok = self.manager.delete_saved_tab(cid, url)
                 return self._send_json({"id": cid, "url": url, "deleted": ok})
             if method == "POST":
                 if action == "hibernate":

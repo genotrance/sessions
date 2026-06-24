@@ -1307,5 +1307,241 @@ class TestEventLoopDisposingCtxs(_PatchedManagerMixin, unittest.TestCase):
         self.assertIn("_session_last_active", src)
 
 
+# ---------------------------------------------------------------------------
+# Chrome stability flags and logging (A, C, D, E)
+# ---------------------------------------------------------------------------
+
+class TestChromeStabilityFlags(unittest.TestCase):
+    """Guard: ChromeManager.start must include stability and logging flags."""
+
+    def test_start_includes_stability_flags(self):
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        for flag in ("--disable-background-timer-throttling",
+                     "--disable-renderer-backgrounding",
+                     "--disable-backgrounding-occluded-windows",
+                     "--disable-ipc-flooding-protection",
+                     "--disable-hang-monitor"):
+            self.assertIn(flag, src)
+
+    def test_start_includes_logging_flags(self):
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertIn("--enable-logging", src)
+        self.assertIn("--v=1", src)
+        self.assertIn("--log-file=", src)
+
+    def test_breakpad_not_disabled(self):
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertNotIn("--disable-breakpad", src)
+
+    def test_crash_dumps_dir(self):
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertIn("--crash-dumps-dir=", src)
+
+    def test_stderr_captured(self):
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertIn("chrome_stderr.log", src)
+        self.assertNotIn("subprocess.DEVNULL", src.split("stderr")[0].split("\n")[-1]
+                         if "stderr" in src else "")
+
+    def test_debug_log_rotated_on_start(self):
+        """chrome_debug.log must be rotated to a timestamped file on start."""
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        # Must rename the old log before Chrome starts
+        self.assertIn("os.rename", src)
+        # Must keep timestamped generations and prune old ones
+        self.assertIn("old_logs[3:]", src)
+
+    def test_stderr_append_mode(self):
+        """chrome_stderr.log must be opened in append mode."""
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertIn('"a"', src)
+
+    def test_stderr_restart_separator(self):
+        """A separator with timestamp is written on each Chrome start."""
+        import inspect
+        src = inspect.getsource(cdp.ChromeManager.start)
+        self.assertIn("Chrome start:", src)
+
+    def test_dispose_delay_constant(self):
+        """_DISPOSE_DELAY must exist to prevent ACCESS_VIOLATION on dispose."""
+        self.assertGreaterEqual(ContainerManager._DISPOSE_DELAY, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Deep idle snapshot tiering (B2)
+# ---------------------------------------------------------------------------
+
+class TestDeepIdleTiering(_PatchedManagerMixin, unittest.TestCase):
+    """Guard: snapshot_all uses three tiers — active, idle, deep-idle."""
+
+    def test_deep_idle_constants_exist(self):
+        self.assertTrue(hasattr(ContainerManager, '_DEEP_IDLE_THRESHOLD_SEC'))
+        self.assertTrue(hasattr(ContainerManager, '_DEEP_IDLE_SNAPSHOT_MULTIPLE'))
+        self.assertGreater(ContainerManager._DEEP_IDLE_THRESHOLD_SEC,
+                           ContainerManager._IDLE_THRESHOLD_SEC)
+        self.assertGreater(ContainerManager._DEEP_IDLE_SNAPSHOT_MULTIPLE,
+                           ContainerManager._IDLE_SNAPSHOT_MULTIPLE)
+
+    def test_deep_idle_skipped_on_non_matching_cycle(self):
+        """Deep-idle sessions are skipped when cycle % multiple != 0."""
+        a = self.store.create_container("active")
+        d = self.store.create_container("deep-idle")
+        self.mgr.restore(a["id"])
+        self.mgr.restore(d["id"])
+        now = time.time()
+        self.mgr._session_last_active[a["id"]] = now
+        # Make d deep-idle (>30 min ago)
+        self.mgr._session_last_active[d["id"]] = now - 3600
+        # Set cycle to one that doesn't match deep-idle multiple
+        non_matching = 1
+        while non_matching % self.mgr._DEEP_IDLE_SNAPSHOT_MULTIPLE == 0:
+            non_matching += 1
+        self.mgr._snapshot_cycle = non_matching - 1
+        results = self.mgr.snapshot_all()
+        snapped_ids = {r["id"] for r in results if "id" in r}
+        self.assertIn(a["id"], snapped_ids)
+        self.assertNotIn(d["id"], snapped_ids)
+
+    def test_deep_idle_included_on_matching_cycle(self):
+        """Deep-idle sessions are included when cycle % multiple == 0."""
+        a = self.store.create_container("active")
+        d = self.store.create_container("deep-idle")
+        self.mgr.restore(a["id"])
+        self.mgr.restore(d["id"])
+        now = time.time()
+        self.mgr._session_last_active[a["id"]] = now
+        self.mgr._session_last_active[d["id"]] = now - 3600
+        matching = self.mgr._DEEP_IDLE_SNAPSHOT_MULTIPLE
+        self.mgr._snapshot_cycle = matching - 1
+        results = self.mgr.snapshot_all()
+        snapped_ids = {r["id"] for r in results if "id" in r}
+        self.assertIn(a["id"], snapped_ids)
+        self.assertIn(d["id"], snapped_ids)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot worker cap (B2)
+# ---------------------------------------------------------------------------
+
+class TestSnapshotWorkerCap(unittest.TestCase):
+    """Guard: snapshot max workers is capped at a reasonable number."""
+
+    def test_max_workers_constant(self):
+        self.assertTrue(hasattr(ContainerManager, '_SNAPSHOT_MAX_WORKERS'))
+        self.assertLessEqual(ContainerManager._SNAPSHOT_MAX_WORKERS, 4)
+
+    def test_snapshot_all_uses_cap(self):
+        import inspect
+        src = inspect.getsource(ContainerManager.snapshot_all)
+        self.assertIn("_SNAPSHOT_MAX_WORKERS", src)
+
+
+# ---------------------------------------------------------------------------
+# Unique profile avatars (F)
+# ---------------------------------------------------------------------------
+
+class TestProfileAvatars(unittest.TestCase):
+    """Guard: profile sessions get unique avatar icons."""
+
+    def test_avatar_deterministic(self):
+        idx1 = cdp._avatar_index_for_cid("test-session-1")
+        idx2 = cdp._avatar_index_for_cid("test-session-1")
+        self.assertEqual(idx1, idx2)
+
+    def test_avatar_varies_by_cid(self):
+        indices = {cdp._avatar_index_for_cid(f"s-{i}") for i in range(20)}
+        # At least a few distinct avatars out of 20 sessions
+        self.assertGreater(len(indices), 3)
+
+    def test_avatar_icon_url_format(self):
+        url = cdp._avatar_icon_for_index(5)
+        self.assertTrue(url.startswith("chrome://theme/IDR_PROFILE_AVATAR_"))
+
+    def test_register_in_local_state_uses_avatar(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cdp._register_in_local_state(tmpdir, "test-cid")
+            ls_path = os.path.join(tmpdir, "Local State")
+            with open(ls_path) as f:
+                state = json.load(f)
+            prof_dir = cdp.profile_dir_name("test-cid")
+            entry = state["profile"]["info_cache"][prof_dir]
+            self.assertIn("IDR_PROFILE_AVATAR_", entry["avatar_icon"])
+            self.assertFalse(entry["is_using_default_avatar"])
+            self.assertFalse(entry["is_using_default_name"])
+
+
+# ---------------------------------------------------------------------------
+# Liveness probe skip (B3)
+# ---------------------------------------------------------------------------
+
+class TestLivenessProbeSkip(unittest.TestCase):
+    """Guard: _browser_session skips Browser.getVersion when recently used."""
+
+    def test_probe_skip_constant_exists(self):
+        self.assertTrue(hasattr(ContainerManager, '_BS_PROBE_SKIP_SEC'))
+        self.assertGreater(ContainerManager._BS_PROBE_SKIP_SEC, 0)
+
+    def test_probe_skip_in_source(self):
+        import inspect
+        src = inspect.getsource(ContainerManager._browser_session)
+        self.assertIn("_BS_PROBE_SKIP_SEC", src)
+        self.assertIn("_bs_last_ok", src)
+
+
+# ---------------------------------------------------------------------------
+# Event-driven activation loop (B1)
+# ---------------------------------------------------------------------------
+
+class TestEventDrivenActivation(unittest.TestCase):
+    """Guard: activation loop uses Target.setDiscoverTargets events."""
+
+    def test_event_listen_interval_exists(self):
+        self.assertTrue(hasattr(ContainerManager, '_EVENT_LISTEN_INTERVAL'))
+        self.assertLess(ContainerManager._EVENT_LISTEN_INTERVAL,
+                        ContainerManager._FOCUS_POLL_INTERVAL)
+
+    def test_uses_set_discover_targets(self):
+        import inspect
+        src = inspect.getsource(ContainerManager._activation_event_loop)
+        self.assertIn("Target.setDiscoverTargets", src)
+        self.assertIn("Target.targetInfoChanged", src)
+
+    def test_focus_poll_interval_reduced(self):
+        self.assertGreaterEqual(ContainerManager._FOCUS_POLL_INTERVAL, 10)
+
+
+# ---------------------------------------------------------------------------
+# _close_newtab_targets waits for tabs to finish loading (profile restore)
+# ---------------------------------------------------------------------------
+
+class TestCloseNewtabSettling(unittest.TestCase):
+    """Guard: _close_newtab_targets waits for loading tabs to settle."""
+
+    def test_settling_loop_exists_in_source(self):
+        """The settling polling loop must be present."""
+        import inspect
+        src = inspect.getsource(ContainerManager._close_newtab_targets)
+        self.assertIn("_SETTLE_MAX", src)
+        self.assertIn("_SETTLE_INTERVAL", src)
+        self.assertIn("stable_ticks", src)
+
+    def test_junk_only_blank_urls_when_expected_provided(self):
+        """When expected_urls is given, only blank URLs count as junk."""
+        import inspect
+        src = inspect.getsource(ContainerManager._close_newtab_targets)
+        # Must intersect with _BLANK before considering as junk
+        self.assertIn("_BLANK", src)
+        # Should NOT close tabs simply because they aren't in expected_urls
+        self.assertNotIn("not in expected_urls\n", src)
+
+
 if __name__ == "__main__":
     unittest.main()

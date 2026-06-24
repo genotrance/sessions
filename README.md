@@ -64,6 +64,7 @@ pip install -e .
 - **Move tab** (scissors icon) — Cut a tab from one session and paste it into another. Hover over a tab to see the scissors icon; click it, then click the paste icon on any other session. Works between active and hibernated sessions — cookies, localStorage, and IndexedDB for that tab's origin are transferred. Press Escape to cancel.
 - **Delete** (trash icon) — Permanently removes a session and all its saved data.
 - **Clean** — Wipes cookies, localStorage, and IndexedDB for a session. For running sessions, data is cleared in the live browser so it behaves like a fresh session without needing to restart.
+- **Auto-clean on tab close** — Closing a tab in a Session (profile-backed) automatically clears that site's cookies, localStorage, and IndexedDB from the profile, so no data lingers from briefly visited sites.
 - **Restart** — Restarts the Sessions backend while keeping Chrome running.
 - **Quit** — Saves all sessions and shuts down both the backend and Chrome.
 
@@ -95,10 +96,12 @@ Right-click any session for a context menu with **Restore**, **Hibernate**, **Cl
 - **Move tabs between sessions** — Cut a tab from any session and paste it into another. Works across session types.
 - **Tab restoration** — Hibernated sessions restore all tabs with their original URLs and site data.
 - **Crash recovery** — If Chrome dies unexpectedly, Sessions restarts it and restores your work. Profile sessions are re-launched and Lite Sessions are restored from snapshots.
+- **Unique profile icons** — Each Session (profile-backed) gets a distinct Chrome avatar icon so windows are easy to tell apart in the taskbar and Alt-Tab. Renaming a session updates the icon label.
 - **Cross-platform** — Works on Windows, macOS, and Linux with Chrome or Edge.
 - **Two-column dashboard** — Active sessions on the left, hibernated on the right. Green borders for Lite Sessions, blue for Sessions.
 - **Dashboard UI** — A lightweight web dashboard for managing sessions from any tab.
 - **Keyboard hotkey** — Press `Win+/` (Windows) or `Ctrl+/` (macOS/Linux) to open the dashboard instantly. Disable with `--no-hotkey` if it conflicts with other software.
+- **Chrome diagnostics** — Chrome native logs (`chrome_debug.log`), stderr capture (`chrome_stderr.log`), and crash dumps (`crashes/`) are written to the user data directory for troubleshooting. Logs are rotated on restart (keeping 3 previous generations) so crash-era diagnostics are preserved.
 
 ## Options
 

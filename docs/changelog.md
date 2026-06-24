@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-06-24
+
+### Added
+
+- **Unique profile avatars**: Each profile session now gets a distinct Chrome avatar icon (deterministic based on session ID). Profile windows are visually distinguishable in the taskbar, Alt-Tab, and Chrome's profile picker. Renaming a session updates the profile display name and icon.
+- **Chrome native logging**: Chrome is launched with `--enable-logging --v=1` and logs to `chrome_debug.log` in the user data directory for post-mortem diagnostics.
+- **Chrome crash dumps**: Added `--crash-dumps-dir` flag so Chrome writes crash dumps to a `crashes/` folder in the user data directory.
+- **Chrome stderr capture**: Chrome's stderr is now written to `chrome_stderr.log` instead of being discarded, capturing GPU errors, sandbox warnings, and crash signatures.
+
+### Fixed
+
+- **Profile avatars not showing**: Chrome ignored the custom avatar because `is_using_default_avatar` was set to `true` in Local State, and Preferences used the wrong field (`avatar_icon` URL instead of `avatar_index` integer). Avatars now appear correctly in the taskbar, Alt-Tab, and Chrome's profile picker.
+- **Phantom "Your Chrome" profiles**: Chrome's auto-created `Default` profile entry and the `sessions-default` base profile both showed as "Your Chrome" in the profile picker. The phantom `Default` entry is now removed on startup, and the base profile is named "Sessions".
+- **Profile restore closing legitimate tabs**: After restoring a profile session, the junk-tab cleaner ran before tabs finished loading — tabs still showing `about:blank` mid-navigation were misidentified as junk and closed. The cleaner now polls until tab URLs stabilise before deciding what to close, and only closes known blank URLs (`about:blank`, `chrome://newtab/`) rather than anything not in the expected set.
+- **Chrome crash on context dispose**: Chrome could crash with an `ACCESS_VIOLATION` when `disposeBrowserContext` ran immediately after closing tabs, before Chrome finished tearing down renderer connections. A 1.5-second delay is now inserted between tab closure and context disposal.
+
+### Improved
+
+- **Event-driven tab activation**: Tab focus detection now uses CDP `Target.targetInfoChanged` events instead of polling every 2 seconds. A fallback `hasFocus()` poll runs every 30 seconds. This reduces CDP round-trips from ~30/min per tab to near zero during normal use.
+- **Three-tier snapshot frequency**: Sessions are now categorised as active (<5 min), idle (5–30 min), or deep-idle (>30 min). Deep-idle sessions are snapshotted every 8th cycle instead of every 4th, further reducing Chrome pressure.
+- **Lower snapshot parallelism**: Maximum parallel CDP connections during snapshotting reduced from 4 to 2, easing Chrome's IO thread load.
+- **Smarter CDP liveness probes**: The shared browser session skips the `Browser.getVersion` health check if it was successfully used within the last 10 seconds, eliminating one round-trip per watcher tick.
+- **Chrome stability flags**: Added `--disable-background-timer-throttling`, `--disable-renderer-backgrounding`, `--disable-backgrounding-occluded-windows`, `--disable-ipc-flooding-protection`, and `--disable-hang-monitor` to prevent Chrome from throttling or killing renderers that CDP is talking to.
+- **Breakpad crash reporting re-enabled**: Removed `--disable-breakpad` so Chrome can generate crash reports for diagnostics.
+- **Chrome log preservation across restarts**: `chrome_debug.log` is now rotated to a timestamped file (e.g. `chrome_debug.log.20260624_113330`) before each Chrome start, keeping the 3 most recent generations. `chrome_stderr.log` is opened in append mode with a restart separator instead of being truncated. Crash-era diagnostics now survive crash-recovery restarts.
+
+## [0.2.6] - 2026-06-14
+
+### Fixed
+
+- **Extension copying failure during profile creation**: `shutil.copytree` raised `WinError 183` when destination extension directories already existed (e.g. from a partial previous creation). Now uses `dirs_exist_ok=True` so copies succeed even if the directory is partially populated.
+- **Orphaned profile directories not cleaned up**: Stale profile directories on disk (from deleted or re-typed sessions) were never removed, causing ghost profiles in Chrome's profile picker. Added `cleanup_orphaned_profile_dirs` that runs before Chrome starts, removing directories with no matching DB entry.
+- **Unwanted default home page tab on profile restore**: Chrome opens a `chrome://newtab/` page when a profile window is created via IPC. After restoring saved tabs (via prefs or CDP fallback), the leftover new-tab page is now automatically closed.
+- **Profile activation during creation**: Clicking Restore on a profile session while extensions were still being copied could cause errors. Profile creation now tracks a "creating" state that blocks restore attempts and shows a "Creating…" indicator in the dashboard.
+
+### Added
+
+- **Site data cleanup on profile tab close**: When a tab is closed in a profile session, its origin's cookies, localStorage, and IndexedDB are automatically cleared so no site data lingers on disk — similar to ephemeral lite-session behaviour. Deleting saved tabs from hibernated profile sessions also removes the origin's stored cookies and storage from the DB.
+
 ## [0.2.5] - 2026-06-10
 
 ### Fixed

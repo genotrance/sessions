@@ -214,6 +214,32 @@ class ChromeManager:
                 "Install Chrome or Edge.")
         _migrate_base_profile(self.user_data_dir)
         cleanup_stale_profiles(self.user_data_dir)
+        # -- Chrome native logging: writes chrome_debug.log into user-data-dir.
+        # Chrome truncates --log-file on start, so rotate the existing log
+        # to a timestamped name.  Keep the most recent 3 generations so
+        # crash diagnostics survive multiple restart cycles.
+        chrome_log_file = os.path.join(self.user_data_dir, "chrome_debug.log")
+        try:
+            if os.path.isfile(chrome_log_file):
+                import datetime
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                rotated = chrome_log_file + f".{ts}"
+                os.rename(chrome_log_file, rotated)
+                # Prune oldest rotated logs beyond 3
+                import glob as _glob
+                old_logs = sorted(
+                    _glob.glob(chrome_log_file + ".*"),
+                    key=os.path.getmtime, reverse=True)
+                for stale in old_logs[3:]:
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        # -- Crash dumps directory
+        crash_dir = os.path.join(self.user_data_dir, "crashes")
+        os.makedirs(crash_dir, exist_ok=True)
         args = [
             self.chrome_path,
             f"--remote-debugging-port={self.port}",
@@ -224,9 +250,21 @@ class ChromeManager:
             "--disable-default-apps",
             "--disable-popup-blocking",
             "--disable-translate",
-            "--disable-breakpad",
             "--metrics-recording-only",
             "--remote-allow-origins=*",
+            # Chrome native logging for diagnostics
+            "--enable-logging",
+            "--v=1",
+            f"--log-file={chrome_log_file}",
+            # Crash dumps for post-mortem analysis
+            f"--crash-dumps-dir={crash_dir}",
+            # Automation stability flags — prevent Chrome from throttling,
+            # suspending, or killing renderers that CDP is talking to.
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-ipc-flooding-protection",
+            "--disable-hang-monitor",
         ]
         if headless:
             args.append("--headless=new")
@@ -235,8 +273,31 @@ class ChromeManager:
         if extra_args:
             args.extend(extra_args)
         args.append(start_url)
+        # Capture Chrome stderr to a log file for GPU errors, sandbox
+        # warnings, and crash signatures that are otherwise invisible.
+        self._stderr_log_path = os.path.join(self.user_data_dir, "chrome_stderr.log")
+        # Truncate if over 5 MB to prevent unbounded growth
+        try:
+            if (os.path.isfile(self._stderr_log_path)
+                    and os.path.getsize(self._stderr_log_path) > 5 * 1024 * 1024):
+                # Keep the last 1 MB
+                with open(self._stderr_log_path, "rb") as _rf:
+                    _rf.seek(-1024 * 1024, 2)
+                    tail = _rf.read()
+                with open(self._stderr_log_path, "wb") as _wf:
+                    _wf.write(tail)
+        except OSError:
+            pass
+        self._stderr_file = open(self._stderr_log_path, "a")
+        # Write a separator so each Chrome run is clearly delimited
+        import datetime as _dt
+        self._stderr_file.write(
+            f"\n{'=' * 72}\n"
+            f"Chrome start: {_dt.datetime.now().isoformat()}\n"
+            f"{'=' * 72}\n")
+        self._stderr_file.flush()
         popen_kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL,
-                                        "stderr": subprocess.DEVNULL}
+                                        "stderr": self._stderr_file}
         if IS_WINDOWS:
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -282,6 +343,14 @@ class ChromeManager:
                 pass
         self._remove_pid()
         self._proc = None
+        # Close stderr log file handle
+        sf = getattr(self, '_stderr_file', None)
+        if sf:
+            try:
+                sf.close()
+            except Exception:
+                pass
+            self._stderr_file = None
 
     def is_running(self) -> bool:
         return self._cdp_ready()
@@ -411,6 +480,22 @@ def ensure_chrome(port: int = DEFAULT_PORT, headless: bool = False,
 _PROFILE_PREFIX = "sessions-"
 _SHADOW_TABS_FILE = "sessions_tabs.json"
 
+# Chrome has 28 built-in profile avatars (IDR_PROFILE_AVATAR_0 .. _27).
+# We cycle through a visually distinctive subset so each profile window
+# gets a unique icon in the taskbar / Alt-Tab.
+_NUM_CHROME_AVATARS = 28
+
+
+def _avatar_icon_for_index(idx: int) -> str:
+    """Return the chrome://theme avatar URL for a 0-based index."""
+    return f"chrome://theme/IDR_PROFILE_AVATAR_{idx % _NUM_CHROME_AVATARS}"
+
+
+def _avatar_index_for_cid(cid: str) -> int:
+    """Deterministic avatar index derived from the container id."""
+    import hashlib
+    return int(hashlib.md5(cid.encode(), usedforsecurity=False).hexdigest(), 16) % _NUM_CHROME_AVATARS
+
 
 def profile_dir_name(cid: str) -> str:
     """Return the Chrome profile directory name for a container id."""
@@ -468,7 +553,8 @@ def _copy_extensions(base_profile: str, dest_profile: str) -> None:
         src = os.path.join(base_profile, dirname)
         dst = os.path.join(dest_profile, dirname)
         if os.path.isdir(src):
-            shutil.copytree(src, dst, ignore=_ignore_locks)
+            shutil.copytree(src, dst, ignore=_ignore_locks,
+                            dirs_exist_ok=True)
             copied.append(dirname)
 
     # Copy Secure Preferences (contains extension entries + valid HMACs)
@@ -480,7 +566,8 @@ def _copy_extensions(base_profile: str, dest_profile: str) -> None:
     log.debug("_copy_extensions: copied %s from %s", copied, base_profile)
 
 
-def create_profile_dir(user_data_dir: str, cid: str) -> str:
+def create_profile_dir(user_data_dir: str, cid: str,
+                       display_name: str | None = None) -> str:
     """Create a Chrome profile directory with extensions from the base profile.
 
     1. Copies the base ``Preferences`` (which contains ``install_signature``
@@ -488,6 +575,7 @@ def create_profile_dir(user_data_dir: str, cid: str) -> str:
        ``session`` and ``profile`` keys.
     2. Copies extensions and their state from the base profile so that the
        new profile starts with the same extensions already installed.
+    3. Sets a unique avatar icon so the profile is visually distinguishable.
 
     Returns the full path to the created directory.
     """
@@ -511,7 +599,8 @@ def create_profile_dir(user_data_dir: str, cid: str) -> str:
     else:
         prefs = {}
     prefs["session"] = {"restore_on_startup": 1}
-    prefs.setdefault("profile", {})["name"] = cid
+    prefs.setdefault("profile", {})["name"] = display_name or cid
+    prefs["profile"]["avatar_index"] = _avatar_index_for_cid(cid)
     # Mark as cleanly exited so Chrome doesn't show "not shut down correctly"
     prefs["profile"]["exit_type"] = "Normal"
     prefs["profile"]["exited_cleanly"] = True
@@ -563,14 +652,13 @@ def cleanup_stale_profiles(user_data_dir: str) -> None:
         return
 
     info_cache = state.get("profile", {}).get("info_cache", {})
+    changed = False
     stale = [
         name for name in list(info_cache)
         if name.startswith(_PROFILE_PREFIX)
         and name != _BASE_PROFILE_DIR
         and not os.path.isdir(os.path.join(user_data_dir, name))
     ]
-    if not stale:
-        return
 
     profiles_order = state.get("profile", {}).get("profiles_order", [])
     last_active = state.get("profile", {}).get("last_active_profiles", [])
@@ -580,16 +668,79 @@ def cleanup_stale_profiles(user_data_dir: str) -> None:
             profiles_order.remove(name)
         if name in last_active:
             last_active.remove(name)
+        changed = True
+
+    # Remove Chrome's auto-created "Default" profile entry — we never
+    # use it (our base profile is sessions-default) and it shows as a
+    # confusing "Your Chrome" in the profile picker.  Only do this when
+    # our base profile exists (proving this is a Sessions-managed dir).
+    if ("Default" in info_cache
+            and not os.path.isdir(os.path.join(user_data_dir, "Default"))
+            and os.path.isdir(os.path.join(user_data_dir, _BASE_PROFILE_DIR))):
+        info_cache.pop("Default", None)
+        if "Default" in profiles_order:
+            profiles_order.remove("Default")
+        if "Default" in last_active:
+            last_active.remove("Default")
+        changed = True
+        log.info("cleanup_stale_profiles: removed phantom 'Default' entry")
+
+    # Ensure our base profile has a recognisable name instead of
+    # "Your Chrome" (which is what Chrome shows for is_using_default_name).
+    base_entry = info_cache.get(_BASE_PROFILE_DIR)
+    if base_entry and base_entry.get("is_using_default_name", False):
+        base_entry["name"] = "Sessions"
+        base_entry["is_using_default_name"] = False
+        changed = True
+
+    if not changed:
+        return
+
     try:
         with open(local_state_path, "w", encoding="utf-8") as f:
             json.dump(state, f)
-        log.info("cleanup_stale_profiles: removed %d stale entries: %s",
-                 len(stale), stale)
+        if stale:
+            log.info("cleanup_stale_profiles: removed %d stale entries: %s",
+                     len(stale), stale)
     except OSError:
         pass
 
 
-def _register_in_local_state(user_data_dir: str, cid: str) -> None:
+def cleanup_orphaned_profile_dirs(user_data_dir: str,
+                                  known_profile_cids: set[str]) -> list[str]:
+    """Remove profile directories on disk that are not tracked in the DB.
+
+    *known_profile_cids* should be the set of container IDs that have
+    ``session_type='profile'`` in the database.  Any ``sessions-*``
+    directory (excluding the base ``sessions-default``) whose cid is
+    **not** in this set is deleted.
+
+    Returns the list of removed directory names.
+    """
+    removed: list[str] = []
+    if not os.path.isdir(user_data_dir):
+        return removed
+    for entry in os.listdir(user_data_dir):
+        if not entry.startswith(_PROFILE_PREFIX):
+            continue
+        if entry == _BASE_PROFILE_DIR:
+            continue
+        # Extract the cid from the directory name
+        cid = entry[len(_PROFILE_PREFIX):]
+        if cid in known_profile_cids:
+            continue
+        # Orphaned directory — remove it
+        dir_path = os.path.join(user_data_dir, entry)
+        if os.path.isdir(dir_path):
+            shutil.rmtree(dir_path, ignore_errors=True)
+            _remove_from_local_state(user_data_dir, cid)
+            removed.append(entry)
+            log.info("cleanup_orphaned_profile_dirs: removed %s", entry)
+    return removed
+
+
+def _register_in_local_state(user_data_dir: str, cid: str,
+                             display_name: str | None = None) -> None:
     """Register a profile in Chrome's Local State so Chrome opens it."""
     local_state_path = os.path.join(user_data_dir, "Local State")
     state: dict = {}
@@ -603,16 +754,26 @@ def _register_in_local_state(user_data_dir: str, cid: str) -> None:
     prof_dir = profile_dir_name(cid)
     profile = state.setdefault("profile", {})
     info_cache = profile.setdefault("info_cache", {})
+    avatar = _avatar_icon_for_index(_avatar_index_for_cid(cid))
+    name = display_name or cid
     if prof_dir not in info_cache:
         info_cache[prof_dir] = {
             "active_time": time.time(),
-            "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_26",
+            "avatar_icon": avatar,
             "background_apps": False,
             "is_consented_primary_account": False,
             "is_ephemeral": False,
-            "name": cid,
+            "is_using_default_avatar": False,
+            "is_using_default_name": False,
+            "name": name,
             "user_name": "",
         }
+    else:
+        # Update avatar + name on every registration so renames propagate
+        info_cache[prof_dir]["avatar_icon"] = avatar
+        info_cache[prof_dir]["is_using_default_avatar"] = False
+        info_cache[prof_dir]["is_using_default_name"] = False
+        info_cache[prof_dir]["name"] = name
     profiles_order = profile.setdefault("profiles_order", [])
     if prof_dir not in profiles_order:
         profiles_order.append(prof_dir)
@@ -622,6 +783,35 @@ def _register_in_local_state(user_data_dir: str, cid: str) -> None:
             json.dump(state, f)
     except OSError:
         pass
+
+
+def update_profile_display(user_data_dir: str, cid: str,
+                           display_name: str) -> None:
+    """Update an existing profile's display name and avatar icon.
+
+    Updates both the profile's own ``Preferences`` file and Chrome's
+    ``Local State`` so the name and icon are visible in the titlebar,
+    taskbar, and Alt-Tab.
+    """
+    avatar = _avatar_icon_for_index(_avatar_index_for_cid(cid))
+    # Update profile Preferences
+    prefs_path = os.path.join(profile_dir_path(user_data_dir, cid),
+                              "Preferences")
+    if os.path.isfile(prefs_path):
+        try:
+            with open(prefs_path, encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            prefs = {}
+        prefs.setdefault("profile", {})["name"] = display_name
+        prefs["profile"]["avatar_index"] = _avatar_index_for_cid(cid)
+        try:
+            with open(prefs_path, "w", encoding="utf-8") as f:
+                json.dump(prefs, f)
+        except OSError:
+            pass
+    # Update Local State
+    _register_in_local_state(user_data_dir, cid, display_name=display_name)
 
 
 def _remove_from_local_state(user_data_dir: str, cid: str) -> None:

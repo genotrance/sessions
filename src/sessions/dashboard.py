@@ -345,6 +345,10 @@ document.addEventListener('keydown', e => {
 
 // ── render session list ───────────────────────────────────────────────────────
 function rowActionsHtml(c) {
+  if (c.creating) {
+    return `<span class=row-actions>`
+      + `<span style="color:#f59e0b;font-size:12px;white-space:nowrap">Creating\u2026</span></span>`;
+  }
   const isHot = c.hot;
   return `<span class=row-actions>`
     + `<span class="row-action" title="${isHot?'Hibernate':'Restore'}" `
@@ -410,7 +414,7 @@ function _buildRow(c) {
   if (tabs.length) {
     tabs.forEach((t, ti) => { tabsHtml += makeTabRow(c, t, ti===0); });
   } else {
-    tabsHtml = `<div class=row-empty><span style="color:#475569">${c.hot?'no tabs':'hibernated'}</span>${pasteHtml}${rowActionsHtml(c)}</div>`;
+    tabsHtml = `<div class=row-empty><span style="color:#475569">${c.creating?'creating\u2026':c.hot?'no tabs':'hibernated'}</span>${pasteHtml}${rowActionsHtml(c)}</div>`;
   }
   const cbChecked = selected.has(c.id) ? ' checked' : '';
   el.innerHTML = `<div style="display:flex"><div class=row-cb><input type=checkbox${cbChecked} onchange="toggleSelect('${esc(c.id)}',this)"></div><div class=tabs style="flex:1;min-width:0">${tabsHtml}</div></div>`;

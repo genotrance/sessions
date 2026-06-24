@@ -242,7 +242,12 @@ class ProfileMixin:
 
         prof_name = row.get("profile_dir") or profile_dir_name(cid)
         # Ensure profile directory exists with session restore prefs
-        cdp.create_profile_dir(chrome_mgr.user_data_dir, cid)
+        container_name = row.get("name") or cid
+        cdp.create_profile_dir(chrome_mgr.user_data_dir, cid,
+                               display_name=container_name)
+        # Update display name + avatar in case it was renamed since creation
+        cdp.update_profile_display(chrome_mgr.user_data_dir, cid,
+                                   container_name)
 
         # Record known contexts and target IDs before launch so we can
         # detect new contexts (fresh profile load) or new targets in an
@@ -331,6 +336,8 @@ class ProfileMixin:
             u = t.get("url", "")
             if u and u != "about:blank":
                 expected_urls.add(u)
+        if also_open_url:
+            expected_urls.add(also_open_url)
 
         # Fallback: open saved tabs via CDP if Chrome did not restore them.
         # This triggers when:
@@ -355,6 +362,13 @@ class ProfileMixin:
                                 url=url, browser_context_id=new_ctx)
                         except Exception:
                             pass
+
+        # Close any leftover tabs (homepage, chrome://newtab/, about:blank)
+        # that Chrome opened automatically when the profile window was
+        # created.  These are unwanted when we already opened the desired
+        # tabs above.  _close_newtab_targets waits for tabs to finish
+        # loading before deciding what to close.
+        self._close_newtab_targets(new_ctx, expected_urls=expected_urls)
 
         tabs_count = max(len(real_urls), len(expected_urls))
         log.debug("_restore_profile: done cid=%s ctx=%s tabs=%d",

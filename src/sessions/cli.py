@@ -240,6 +240,19 @@ def cmd_start(args) -> int:
     def _start_chrome_bg():
         try:
             _reclaim_stale_chrome(args.browser_port)
+            # Clean up orphaned profile dirs BEFORE Chrome starts so they
+            # don't appear in Chrome's profile picker.
+            try:
+                known_cids = {c["id"] for c in manager.store.list_containers()
+                              if c.get("session_type") == "profile"}
+                udd = manager._user_data_dir()
+                cdp.cleanup_stale_profiles(udd)
+                removed = cdp.cleanup_orphaned_profile_dirs(udd, known_cids)
+                if removed:
+                    log.info("pre-chrome cleanup: removed %d orphaned dirs: %s",
+                             len(removed), removed)
+            except Exception:
+                log.debug("pre-chrome orphan cleanup failed", exc_info=True)
             _cm = cdp.ensure_chrome(port=args.browser_port, headless=args.headless)
             _chrome_ref.append(_cm)
             log.debug("chrome ready")

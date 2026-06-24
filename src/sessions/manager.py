@@ -11,6 +11,8 @@ import time
 import urllib.parse
 from typing import Any
 
+import websocket
+
 from . import cdp
 from .cdp import CDPSession, CDPError, profile_dir_name
 from .profile import ProfileMixin
@@ -139,6 +141,8 @@ class ContainerManager(ProfileMixin):
         self._snapshot_cycle: int = 0
         # Context IDs being disposed — lets the event loop detach proactively
         self._disposing_ctxs: set[str] = set()
+        # Profile cids currently being created (extensions being copied)
+        self._creating_profiles: set[str] = set()
         # Reference to ChromeManager for launching profile windows
         self._chrome_mgr: cdp.ChromeManager | None = None
         # Monotonic timestamp of last CDP reconnect — used to suppress
@@ -182,23 +186,34 @@ class ContainerManager(ProfileMixin):
     # snapshotted less frequently (every _IDLE_SNAPSHOT_MULTIPLE cycles).
     _IDLE_THRESHOLD_SEC = 300        # 5 minutes with no focus
     _IDLE_SNAPSHOT_MULTIPLE = 4      # snapshot idle sessions every 4th cycle
+    _DEEP_IDLE_THRESHOLD_SEC = 1800  # 30 minutes with no focus
+    _DEEP_IDLE_SNAPSHOT_MULTIPLE = 8 # snapshot deeply idle every 8th cycle
+    # Max parallel CDP WebSocket connections during snapshotting.
+    # Lower values reduce pressure on Chrome's IO thread.
+    _SNAPSHOT_MAX_WORKERS = 2
+
+    _BS_PROBE_SKIP_SEC = 10.0  # skip liveness probe if session used recently
 
     def _browser_session(self) -> _BorrowedSession:
         with self._bs_lock:
             # If another thread already reconnected, reuse immediately
             if self._cached_bs is not None:
-                # Quick liveness probe — use short timeout so a dead WebSocket
-                # fails fast instead of blocking for 30s
-                try:
-                    self._cached_bs.send("Browser.getVersion",
-                                         timeout=self._CDP_PROBE_TIMEOUT)
-                except Exception:
-                    log.debug("cached CDP session is stale, reconnecting")
+                # Skip the liveness probe if the session was used recently —
+                # saves one CDP round-trip per call during normal operation.
+                now = time.monotonic()
+                if (now - getattr(self, '_bs_last_ok', 0)
+                        > self._BS_PROBE_SKIP_SEC):
                     try:
-                        self._cached_bs.close()
+                        self._cached_bs.send("Browser.getVersion",
+                                             timeout=self._CDP_PROBE_TIMEOUT)
+                        self._bs_last_ok = now
                     except Exception:
-                        pass
-                    self._cached_bs = None
+                        log.debug("cached CDP session is stale, reconnecting")
+                        try:
+                            self._cached_bs.close()
+                        except Exception:
+                            pass
+                        self._cached_bs = None
             if self._cached_bs is not None:
                 return self._BorrowedSession(self._cached_bs)
             # Reconnect while holding the lock — prevents parallel reconnect storms
@@ -300,23 +315,25 @@ class ContainerManager(ProfileMixin):
             if self._evt_thread and self._evt_thread.is_alive():
                 self._evt_thread.join(timeout=join_timeout)
 
-    _FOCUS_POLL_INTERVAL = 2.0
-    _FOCUS_REBUILD_INTERVAL = 30.0
+    _FOCUS_POLL_INTERVAL = 30.0       # hasFocus() fallback poll (reduced from 2s)
+    _EVENT_LISTEN_INTERVAL = 1.0      # how often to drain CDP events
+    _FOCUS_REBUILD_INTERVAL = 60.0    # rebuild attached sessions
     _RECONNECT_SETTLE_SEC = 1.0
 
     def _activation_event_loop(self) -> None:
-        """Poll document.hasFocus() on each hot tab to track Chrome-native
-        tab/window activation.
+        """Track Chrome-native tab/window activation.
 
-        Uses a dedicated browser-level CDP session with
-        Target.attachToTarget(flatten=True) so that Runtime.evaluate can be
-        issued per-tab via ``session_id`` without conflicting with the per-tab
-        direct WS connections used for snapshots.
+        **Primary**: subscribes to ``Target.targetInfoChanged`` events so
+        Chrome pushes activation notifications to us.  Zero per-tab
+        round-trips — just one WebSocket listener.
 
-        Correctly detects:
-          • Tab switches within a window
-          • Window switches (alt-tab, mouse click)
-          • Focus returning to Chrome from another application
+        **Fallback**: every ``_FOCUS_POLL_INTERVAL`` seconds (30s) run a
+        ``document.hasFocus()`` sweep to catch edge cases the event stream
+        misses (e.g. focus returning to Chrome from another application).
+
+        New and toggled sessions are reflected immediately because the
+        ``restore()`` / ``create_container()`` codepaths update ``hot`` and
+        timestamps directly — they don't depend on this loop.
 
         The focused tab's ``_tab_last_activated`` timestamp is updated, and
         the owning session's ``last_accessed_at`` is touched in the DB so the
@@ -326,13 +343,22 @@ class ContainerManager(ProfileMixin):
         attached: dict[str, tuple[str, str]] = {}
         prev_focused: str | None = None
         last_rebuild: float = 0
+        last_focus_poll: float = 0
 
-        log.debug("cdp-events: activation poller started (hasFocus polling)")
+        log.debug("cdp-events: activation loop started (event-driven + %ds fallback poll)",
+                  int(self._FOCUS_POLL_INTERVAL))
 
         def _connect() -> CDPSession | None:
             try:
                 s = CDPSession.connect_browser(self.browser_port)
                 log.debug("cdp-events: browser session connected")
+                # Subscribe to target info changes — Chrome will push
+                # targetInfoChanged when the user switches tabs/windows.
+                try:
+                    s.send("Target.setDiscoverTargets",
+                           {"discover": True}, timeout=5)
+                except Exception as e:
+                    log.debug("cdp-events: setDiscoverTargets failed: %s", e)
                 return s
             except Exception as exc:
                 log.debug("cdp-events: browser connect failed: %s", exc)
@@ -375,7 +401,58 @@ class ContainerManager(ProfileMixin):
                     del attached[tid]
             log.debug("cdp-events: rebuild done, attached=%d", len(attached))
 
-        def _poll() -> None:
+        def _handle_target_event(msg: dict) -> None:
+            """Process a Target.targetInfoChanged event to detect tab activation."""
+            nonlocal prev_focused
+            params = msg.get("params", {})
+            info = params.get("targetInfo", {})
+            if info.get("type") != "page":
+                return
+            tid = info.get("targetId", "")
+            ctx = info.get("browserContextId", "")
+            if not tid or not ctx:
+                return
+            with self._lock:
+                ctx_to_cid = {v: k for k, v in self.hot.items()}
+            if ctx not in ctx_to_cid:
+                return
+            # Chrome doesn't have a single "activated" field, but we can
+            # track focus by checking if the target's title/URL changed
+            # (which fires on any tab interaction).  We use this as a
+            # proxy for "user interacted with this tab".
+            if tid != prev_focused:
+                prev_focused = tid
+                now = time.time()
+                self._tab_last_activated[tid] = now
+                cid = ctx_to_cid.get(ctx, "")
+                if cid:
+                    self._session_last_active[cid] = now
+                    self.store.touch_accessed(cid)
+                    log.debug("cdp-events: targetInfoChanged focus tid=%s cid=%s",
+                              tid[:8], cid)
+
+        def _drain_events() -> None:
+            """Read all pending CDP events from the WebSocket (non-blocking)."""
+            if not bs or not bs.ws:
+                return
+            bs.ws.settimeout(0.1)
+            try:
+                while True:
+                    try:
+                        raw = bs.ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        break
+                    msg = json.loads(raw)
+                    method = msg.get("method", "")
+                    if method == "Target.targetInfoChanged":
+                        _handle_target_event(msg)
+                    # Also dispatch to registered listeners
+                    bs._dispatch_event(msg)
+            except Exception:
+                pass
+
+        def _focus_poll() -> None:
+            """Fallback: poll hasFocus() on attached tabs (infrequent)."""
             nonlocal prev_focused
             with self._lock:
                 ctx_to_cid = {v: k for k, v in self.hot.items()}
@@ -392,25 +469,15 @@ class ContainerManager(ProfileMixin):
                     if val is True:
                         focused_tid = tid
                         focused_ctx = ctx
-                        break  # only one tab can have focus
+                        break
                 except CDPError as e:
-                    # Session-level error (e.g. stale session_id after tab
-                    # close/navigate).  Remove from attached so _rebuild()
-                    # will re-attach the tab fresh on the next cycle.
                     log.debug("cdp-events: session error tid=%s: %s",
                               tid[:8], e)
                     attached.pop(tid, None)
                 except TimeoutError:
-                    # Individual tab unresponsive (frozen renderer, navigating
-                    # to a new page, etc.).  Evict it from attached so the
-                    # next _rebuild() will re-attach it fresh.  Do NOT tear
-                    # down the whole WS connection — other tabs are fine.
                     log.debug("cdp-events: tab timeout, evicting tid=%s",
                               tid[:8])
                     attached.pop(tid, None)
-                # Other exceptions (WebSocket closed, OS errors, …) are NOT
-                # caught here.  They propagate to the outer try/except which
-                # sets bs=None and triggers a full reconnect + rebuild.
             # Evict targets from contexts being disposed
             disposing = self._disposing_ctxs
             if disposing:
@@ -429,7 +496,7 @@ class ContainerManager(ProfileMixin):
                 if cid:
                     self._session_last_active[cid] = now
                     self.store.touch_accessed(cid)
-                    log.debug("cdp-events: focus tid=%s cid=%s",
+                    log.debug("cdp-events: focus poll tid=%s cid=%s",
                               focused_tid[:8], cid)
 
         # --- main loop -------------------------------------------------------
@@ -437,27 +504,23 @@ class ContainerManager(ProfileMixin):
         if bs:
             _rebuild()
 
-        while not self._evt_stop.wait(self._FOCUS_POLL_INTERVAL):
+        while not self._evt_stop.wait(self._EVENT_LISTEN_INTERVAL):
             # Reconnect if needed
             if bs is None:
-                # Back off during crash recovery — Chrome is dead/restarting
                 if self._crash_recovery_inflight.locked():
                     continue
                 bs = _connect()
                 if bs is None:
                     continue
-                # Brief settle time after reconnect lets Chrome's CDP
-                # stabilise, reducing attach failures after sleep/wake.
                 time.sleep(self._RECONNECT_SETTLE_SEC)
                 _rebuild()
+                last_focus_poll = time.monotonic()
                 continue
-            # Periodic rebuild to pick up new/closed tabs
-            if time.monotonic() - last_rebuild > self._FOCUS_REBUILD_INTERVAL:
-                _rebuild()
+            # Drain CDP events (primary activation detection)
             try:
-                _poll()
+                _drain_events()
             except Exception as exc:
-                log.debug("cdp-events: poll error: %s", exc)
+                log.debug("cdp-events: drain error: %s", exc)
                 try:
                     bs.close()
                 except Exception:
@@ -465,6 +528,25 @@ class ContainerManager(ProfileMixin):
                 bs = None
                 attached.clear()
                 prev_focused = None
+                continue
+            # Periodic rebuild to pick up new/closed tabs
+            now_mono = time.monotonic()
+            if now_mono - last_rebuild > self._FOCUS_REBUILD_INTERVAL:
+                _rebuild()
+            # Infrequent fallback hasFocus() poll
+            if now_mono - last_focus_poll > self._FOCUS_POLL_INTERVAL:
+                last_focus_poll = now_mono
+                try:
+                    _focus_poll()
+                except Exception as exc:
+                    log.debug("cdp-events: focus poll error: %s", exc)
+                    try:
+                        bs.close()
+                    except Exception:
+                        pass
+                    bs = None
+                    attached.clear()
+                    prev_focused = None
 
         # Cleanup on stop
         if bs:
@@ -797,10 +879,19 @@ class ContainerManager(ProfileMixin):
         except Exception as e:
             log.debug("_detach_context_sessions: getTargets error: %s", e)
 
+    # Seconds to wait after tab closures before disposing a browser context.
+    # Chrome's IO thread needs time to tear down renderer connections;
+    # disposing immediately can trigger an ACCESS_VIOLATION (0xC0000005).
+    _DISPOSE_DELAY: float = 1.5
+
     def _dispose_context(self, bs: CDPSession, ctx: str,
                          label: str = "") -> None:
         """Detach CDP sessions then dispose a browser context safely."""
         self._detach_context_sessions(ctx, bs)
+        # Give Chrome time to finish renderer teardown before we destroy
+        # the context.  See crash dump b78170f3 (ACCESS_VIOLATION during
+        # disposeBrowserContext immediately after closeTarget).
+        time.sleep(self._DISPOSE_DELAY)
         try:
             bs.target.dispose_browser_context(ctx)
             log.debug("%s: context %s disposed", label or "dispose", ctx)
@@ -808,6 +899,92 @@ class ContainerManager(ProfileMixin):
             log.debug("%s: dispose CDPError (ignored): %s", label or "dispose", e)
         finally:
             self._disposing_ctxs.discard(ctx)
+
+    def _close_newtab_targets(self, ctx: str,
+                              expected_urls: set[str] | None = None) -> None:
+        """Close unwanted tabs in *ctx* that are not among *expected_urls*.
+
+        Chrome opens a default page (new-tab or the profile homepage) when a
+        profile window is created via IPC.  After we have opened the desired
+        tabs (via CDP or prefs), these extra tabs are unwanted clutter.
+
+        If *expected_urls* is given, any tab whose URL is **not** among them is
+        considered junk.  Otherwise fall back to a hardcoded set of well-known
+        blank URLs.  Only close junk if the context has at least one other
+        real page tab so we never close all tabs (which would close the
+        window).
+
+        Before classifying tabs the method waits for all tabs in the context
+        to finish their initial navigation.  Tabs that are still loading show
+        ``about:blank`` temporarily — closing them would kill legitimate tabs
+        that simply haven't navigated yet.
+        """
+        _BLANK = {"chrome://newtab/", "about:blank", "chrome://new-tab-page/"}
+        # Tabs start as about:blank while navigating.  Wait for that count
+        # to stabilise so we don't close tabs mid-navigation.
+        _SETTLE_MAX = 10          # seconds
+        _SETTLE_INTERVAL = 0.75   # seconds between polls
+        _STABLE_REQUIRED = 2      # consecutive polls with same count
+        try:
+            prev_blank = None
+            stable_ticks = 0
+            deadline = time.monotonic() + _SETTLE_MAX
+            while time.monotonic() < deadline:
+                with self._browser_session() as bs:
+                    all_targets = bs.target.get_targets(
+                        timeout=SNAPSHOT_CDP_TIMEOUT)
+                ctx_pages = [t for t in all_targets
+                             if t.get("browserContextId") == ctx
+                             and t.get("type") == "page"]
+                blank_count = sum(
+                    1 for t in ctx_pages if t.get("url", "") in _BLANK)
+                if blank_count == 0:
+                    break  # no loading tabs at all
+                if blank_count == prev_blank:
+                    stable_ticks += 1
+                    if stable_ticks >= _STABLE_REQUIRED:
+                        break  # URLs have stabilised
+                else:
+                    stable_ticks = 0
+                prev_blank = blank_count
+                time.sleep(_SETTLE_INTERVAL)
+
+            # Re-fetch final state after settling
+            with self._browser_session() as bs:
+                all_targets = bs.target.get_targets(
+                    timeout=SNAPSHOT_CDP_TIMEOUT)
+            ctx_pages = [t for t in all_targets
+                         if t.get("browserContextId") == ctx
+                         and t.get("type") == "page"]
+
+            if expected_urls:
+                # Only close tabs that are blank/newtab AND not expected.
+                # Tabs with real URLs (even if not in expected_urls) are
+                # kept — they may be redirects or Chrome-injected pages.
+                junk = [t for t in ctx_pages
+                        if t.get("url", "") in _BLANK
+                        and t.get("url", "") not in expected_urls]
+                real = [t for t in ctx_pages if t not in junk]
+            else:
+                junk = [t for t in ctx_pages if t.get("url", "") in _BLANK]
+                real = [t for t in ctx_pages
+                        if t.get("url", "") not in _BLANK]
+            if not junk or not real:
+                log.debug("_close_newtab_targets: nothing to close "
+                          "(junk=%d real=%d) in ctx %s",
+                          len(junk), len(real), ctx[:12])
+                return
+            with self._browser_session() as bs:
+                for t in junk:
+                    try:
+                        bs.target.close_target(t["targetId"])
+                    except Exception:
+                        pass
+            log.debug("_close_newtab_targets: closed %d junk tabs in ctx %s "
+                      "(urls: %s)", len(junk), ctx[:12],
+                      [t.get("url", "")[:60] for t in junk])
+        except Exception as e:
+            log.debug("_close_newtab_targets: error: %s", e)
 
     def _soft_hibernate(self, cid: str) -> None:
         """Mark a container cold and dispose its browser context WITHOUT
@@ -845,12 +1022,17 @@ class ContainerManager(ProfileMixin):
         if session_type == "profile":
             row = self.store.create_container(
                 name, color, session_type="profile")
+            cid = row["id"]
             # profile_dir must match the actual cid (after dedup)
-            self.store.set_profile_dir(row["id"],
-                                       profile_dir_name(row["id"]))
-            row["profile_dir"] = profile_dir_name(row["id"])
-            self._profile_sessions.add(row["id"])
-            cdp.create_profile_dir(self._user_data_dir(), row["id"])
+            self.store.set_profile_dir(cid, profile_dir_name(cid))
+            row["profile_dir"] = profile_dir_name(cid)
+            self._profile_sessions.add(cid)
+            self._creating_profiles.add(cid)
+            try:
+                cdp.create_profile_dir(self._user_data_dir(), cid,
+                                       display_name=name)
+            finally:
+                self._creating_profiles.discard(cid)
             return row
         return self.store.create_container(name, color)
 
@@ -1038,7 +1220,7 @@ class ContainerManager(ProfileMixin):
         idb_data: dict[str, dict] = {}
         if tab_infos:
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(len(tab_infos), 4)) as pool:
+                    max_workers=min(len(tab_infos), self._SNAPSHOT_MAX_WORKERS)) as pool:
                 futs = {pool.submit(_get_ls_and_idb, t): t for t in tab_infos}
                 try:
                     completed = concurrent.futures.as_completed(futs, timeout=IDB_DUMP_TIMEOUT + 2 * SNAPSHOT_CDP_TIMEOUT)
@@ -1176,30 +1358,37 @@ class ContainerManager(ProfileMixin):
         cycle = self._snapshot_cycle
         now = time.time()
         all_cids = list(self.hot.keys())
-        # Partition into active vs idle based on last focus activity
+        # Partition into active / idle / deep-idle based on last focus
         active_cids = []
         idle_cids = []
+        deep_idle_cids = []
         for cid in all_cids:
             last_active = self._session_last_active.get(cid, now)
-            if now - last_active <= self._IDLE_THRESHOLD_SEC:
+            age = now - last_active
+            if age <= self._IDLE_THRESHOLD_SEC:
                 active_cids.append(cid)
-            else:
+            elif age <= self._DEEP_IDLE_THRESHOLD_SEC:
                 idle_cids.append(cid)
-        # Idle sessions only snapshot every N-th cycle
+            else:
+                deep_idle_cids.append(cid)
+        # Idle sessions: snapshot every N-th cycle
+        # Deep-idle sessions: snapshot every M-th cycle (less often)
+        cids = list(active_cids)
         if cycle % self._IDLE_SNAPSHOT_MULTIPLE == 0:
-            cids = active_cids + idle_cids
-        else:
-            cids = active_cids
-        if idle_cids:
-            log.debug("snapshot_all: cycle %d, %d active + %d idle%s",
+            cids.extend(idle_cids)
+        if cycle % self._DEEP_IDLE_SNAPSHOT_MULTIPLE == 0:
+            cids.extend(deep_idle_cids)
+        if idle_cids or deep_idle_cids:
+            log.debug("snapshot_all: cycle %d, %d active + %d idle + %d deep-idle, "
+                      "snapshotting %d",
                       cycle, len(active_cids), len(idle_cids),
-                      " (idle included)" if cids == all_cids else " (idle skipped)")
+                      len(deep_idle_cids), len(cids))
         results: list[dict] = []
         try:
             if not cids:
                 return results
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(len(cids), 4)) as pool:
+                    max_workers=min(len(cids), self._SNAPSHOT_MAX_WORKERS)) as pool:
                 # Pre-fetch targets once for all parallel snapshots.
                 # This eliminates N redundant getTargets + WebSocket
                 # connections (one per container) during the cycle.
@@ -1328,6 +1517,9 @@ class ContainerManager(ProfileMixin):
 
     def restore(self, cid: str, also_open_url: str | None = None) -> dict:
         log.debug("restore cid=%s also_open_url=%s", cid, also_open_url)
+        if cid in self._creating_profiles:
+            return {"id": cid, "status": "creating",
+                    "error": "Profile is still being created"}
         with self._lock:
             row = self.store.get_container(cid)
             if not row:
@@ -1707,7 +1899,7 @@ class ContainerManager(ProfileMixin):
         # Snapshot all containers in parallel
         results: list[dict] = []
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(len(cids), 4) if cids else 1) as pool:
+                max_workers=min(len(cids), self._SNAPSHOT_MAX_WORKERS) if cids else 1) as pool:
             def _snap(cid):
                 try:
                     return self._snapshot_if_stale(cid)
@@ -1779,6 +1971,7 @@ class ContainerManager(ProfileMixin):
                           reverse=True)
             row["live_tabs"] = tabs
             row["saved_tabs"] = [] if row["hot"] else cold_tabs.get(row["id"], [])
+            row["creating"] = row["id"] in self._creating_profiles
         # Sort: hot sessions first, then cold; within each group by recency desc
         listing.sort(key=lambda r: (
             0 if r["hot"] else 1,
@@ -1836,13 +2029,124 @@ class ContainerManager(ProfileMixin):
 
     def rename(self, cid: str, new_name: str) -> dict:
         self.store.rename_container(cid, new_name)
+        if self.is_profile(cid):
+            try:
+                cdp.update_profile_display(self._user_data_dir(), cid,
+                                           new_name)
+            except Exception as e:
+                log.debug("rename: profile display update error: %s", e)
         return {"id": cid, "name": new_name}
+
+    def delete_saved_tab(self, cid: str, url: str) -> bool:
+        """Delete a saved tab from a hibernated session.
+
+        For profile sessions, also removes the origin's stored cookies
+        and storage from the DB so no site data lingers.
+        """
+        ok = self.store.delete_tab(cid, url)
+        if ok and self.is_profile(cid):
+            origin = _origin_of(url)
+            if origin:
+                log.debug("delete_saved_tab: clearing stored data for %s "
+                          "in profile %s", origin, cid)
+                row = self.store.get_container(cid)
+                if row:
+                    changed = False
+                    cookies = row.get("cookies") or []
+                    if cookies:
+                        filtered = [c for c in cookies
+                                    if origin not in c.get("domain", "")]
+                        if len(filtered) < len(cookies):
+                            changed = True
+                            cookies = filtered
+                    storage = row.get("storage") or {}
+                    if origin in storage:
+                        storage = dict(storage)
+                        del storage[origin]
+                        changed = True
+                    idb = row.get("idb") or {}
+                    if origin in idb:
+                        idb = dict(idb)
+                        del idb[origin]
+                        changed = True
+                    if changed:
+                        tabs = row.get("tabs") or []
+                        self.store.save_hibernation(
+                            cid, cookies, storage, tabs, idb=idb)
+        return ok
 
     def close_tab(self, target_id: str) -> dict:
         log.debug("close_tab targetId=%s", target_id)
+        # For profile sessions, clear the tab's site data before closing so
+        # cookies, localStorage, and IndexedDB don't persist on disk.
+        self._maybe_clear_tab_site_data(target_id)
         with self._browser_session() as bs:
             bs.target.close_target(target_id)
         return {"targetId": target_id, "closed": True}
+
+    def _maybe_clear_tab_site_data(self, target_id: str) -> None:
+        """If *target_id* belongs to a profile session, clear its origin's
+        cookies, localStorage, and IndexedDB so no site data lingers after
+        the tab is closed — similar to ephemeral lite-session behaviour."""
+        try:
+            info = self._get_targets_cached()
+            t = next((x for x in info if x["id"] == target_id), None)
+            if not t:
+                return
+            ctx = t.get("browserContextId", "")
+            url = t.get("url", "")
+            if not ctx or not url:
+                return
+            # Check if this context belongs to a profile session
+            cid = None
+            for c, c_ctx in self.hot.items():
+                if c_ctx == ctx:
+                    cid = c
+                    break
+            if not cid or not self.is_profile(cid):
+                return
+            origin = _origin_of(url)
+            if not origin:
+                return
+            log.debug("_maybe_clear_tab_site_data: clearing %s for profile %s",
+                      origin, cid)
+            # Clear localStorage + IndexedDB via JS on the tab
+            ws_url = t.get("webSocketDebuggerUrl")
+            if ws_url:
+                try:
+                    with CDPSession(ws_url, timeout=5) as ts:
+                        ts.runtime.evaluate(
+                            "try{localStorage.clear()}catch(e){}", timeout=2)
+                        ts.runtime.evaluate(
+                            "(async()=>{try{const dbs=await indexedDB.databases();"
+                            "for(const db of dbs){indexedDB.deleteDatabase(db.name);}"
+                            "}catch(e){}})()",
+                            await_promise=True, timeout=5)
+                except Exception as e:
+                    log.debug("_maybe_clear_tab_site_data: JS clear error: %s", e)
+            # Clear cookies for this origin via CDP
+            try:
+                with self._browser_session() as bs:
+                    all_cookies = bs.storage.get_cookies(
+                        browser_context_id=ctx)
+                    origin_cookies = [
+                        c for c in all_cookies
+                        if c.get("domain", "").lstrip(".") in origin
+                    ]
+                    if origin_cookies:
+                        for ck in origin_cookies:
+                            try:
+                                bs.storage.delete_cookies(
+                                    name=ck["name"], domain=ck["domain"],
+                                    path=ck.get("path", "/"))
+                            except Exception:
+                                pass
+                        log.debug("_maybe_clear_tab_site_data: cleared %d cookies",
+                                  len(origin_cookies))
+            except Exception as e:
+                log.debug("_maybe_clear_tab_site_data: cookie clear error: %s", e)
+        except Exception as e:
+            log.debug("_maybe_clear_tab_site_data: error: %s", e)
 
     def move_tab(self, src_cid: str, dest_cid: str,
                  url: str = "", target_id: str = "") -> dict:
